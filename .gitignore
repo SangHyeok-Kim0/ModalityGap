@@ -1,0 +1,19 @@
+.venv/
+venv/
+.venv*/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.ipynb_checkpoints/
+wandb/
+
+# datasets
+coco/
+data/
+
+# experiment outputs
+outputs/
+checkpoints/
+*.pt
+*.pth

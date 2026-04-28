@@ -48,8 +48,8 @@ import torch.nn as nn
 
 
 
-from Multimodality.ModGap.metrics import *
-from Multimodality.ModGap.losses import *
+from metrics import *
+from losses import *
 
 
 import warnings
