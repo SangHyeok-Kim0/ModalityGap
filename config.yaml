@@ -1,0 +1,39 @@
+# Description
+# Baseline configuration where we use the original CLIP anchor loss
+# with temperature as a learnable parameter.
+
+# Identifiers
+project_name: "Sparsify_experiments"
+run_name: "closing_gap_groupwise_semantics"
+
+# Never change parameters
+seed: 42
+learning_rate: 1e-4
+batch_size: 256
+model: "RN50"
+num_train_samples: -1
+num_test_samples: 512
+epochs: 100
+
+# Experiment specific parameters
+loss_type: "only_lunif_n_then_anchor+ALPHA*lalign+BETA*lunif(centroids)"
+only_lunif_epochs: 0
+anchor_temperature: 0.1
+anchor_temperature_learnable: false
+dataset: 'coco'
+
+# Evaluation and checkpointing
+save_checkpoint_every_n_epochs: 20
+resume_checkpoint: False
+
+# fp16
+fp16: True
+
+
+#BETA CONFIG
+beta_warmup_epoch: 20
+beta_decay_epoch: 50
+
+#ALPHA CONFIG
+alpha_warmup_epoch: 50
+alpha_increment_epoch: 50 
