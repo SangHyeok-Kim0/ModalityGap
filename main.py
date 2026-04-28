@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# coding: utf-8
+# coding: utf-8.
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import random
 
 import torch 
 import json
+
 
 import torch
 import os
@@ -47,8 +48,8 @@ import torch.nn as nn
 
 
 
-from metrics import *
-from losses import *
+from Multimodality.ModGap.metrics import *
+from Multimodality.ModGap.losses import *
 
 
 import warnings
