@@ -66,8 +66,10 @@ loss =  anchor + config["lambda1"] * lalign + config["lambda2"] * lunif_centroid
 Configure your `config.yaml` file, then run:
 
 ```bash
-python main.py --device 0 --config config.yaml
+python Code/ModalityGap/main.py --device 0 --config Code/ModalityGap/config.yaml
 ```
+
+Paths inside the script are resolved relative to the project file itself (`__file__`), so you can launch from any current working directory. Datasets are expected under `Code/ModalityGap/data/` (COCO under `data/coco/`, CIFAR-10 under `data/cifar-10-batches-py/`).
 
 Please note that the code provided is built to run two-modal experiments, with baseline model RN50 from openclip.
 

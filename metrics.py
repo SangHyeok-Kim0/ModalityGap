@@ -1,3 +1,4 @@
+import os
 import torch
 from sklearn.cluster import KMeans
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_score, accuracy_score, classification_report
@@ -8,6 +9,9 @@ import torch.nn as nn
 from sklearn.neighbors import KNeighborsClassifier
 import math
 from typing import List, Dict
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(PROJECT_ROOT, 'data')
 
 def compute_metric_ret(score_matrix: torch.Tensor, ids: List[int], ids_txt: List[int], direction: str = 'forward') -> Dict[str, float]:
     """
@@ -74,8 +78,8 @@ def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor, ids_t
     from pycocotools.coco import COCO
 
     # File paths
-    instances_path = 'coco/annotations/instances_val2017.json'
-    captions_path = 'coco/annotations/captions_val2017.json'
+    instances_path = os.path.join(DATA_ROOT, 'coco/annotations/instances_val2017.json')
+    captions_path = os.path.join(DATA_ROOT, 'coco/annotations/captions_val2017.json')
 
     true_labels = []
 

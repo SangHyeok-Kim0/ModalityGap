@@ -3,8 +3,8 @@
 # with temperature as a learnable parameter.
 
 # Identifiers
-project_name: "Sparsify_experiments"
-run_name: "closing_gap_groupwise_semantics"
+project_name: "modality_gap"
+run_name: "baseline_learnable_temperature"
 
 # Never change parameters
 seed: 42
@@ -27,7 +27,7 @@ save_checkpoint_every_n_epochs: 20
 resume_checkpoint: False
 
 # fp16
-fp16: True
+fp16: False
 
 
 #BETA CONFIG

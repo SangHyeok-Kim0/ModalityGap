@@ -55,9 +55,14 @@ from losses import *
 import warnings
 warnings.filterwarnings("ignore", message=".*'force_all_finite' was renamed to 'ensure_all_finite'.*")
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(PROJECT_ROOT, 'data')
+MODELS_ROOT = os.path.join(PROJECT_ROOT, 'models')
+os.makedirs(MODELS_ROOT, exist_ok=True)
 
 
-def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torch.device, plot_embeddings=True, loss_fn=None) -> Dict[str, float]:
+
+def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torch.device, model_name: str, plot_embeddings=True, loss_fn=None) -> Dict[str, float]:
     """
     Evaluate the (OpenCLIP) model on the given test_loader by computing
     text-to-image and image-to-text retrieval metrics, along with additional metrics.
@@ -84,7 +89,7 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
 
     current_index = 0
     
-    tokenizer = open_clip.get_tokenizer('RN50')
+    tokenizer = open_clip.get_tokenizer(model_name)
     
     CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
                    'dog', 'frog', 'horse', 'ship', 'truck']
@@ -240,18 +245,22 @@ def train_model(config, train_loader, test_loader, device):
     # Set up training parameters
     lr = config["learning_rate"]
     epochs = config["epochs"]
-    temperature = config["anchor_temperature"]
     start_epoch = 0
 
     # Load the roberta model for anchor-roberta loss
     if config["loss_type"] == "anchor-roberta":
         roberta = SentenceTransformer('stsb-roberta-large').to(device)
-    
-    # Set up learnable temperature if required
-    if config["anchor_temperature_learnable"]:
-        temperature = torch.nn.Parameter(torch.tensor(temperature), requires_grad=True)
 
-    loss_fn = ClipLoss(temperature=temperature)
+    # ClipLoss owns the temperature scalar (Parameter when learnable, buffer
+    # otherwise). All other loss branches that call contrastive_loss(...)
+    # reuse loss_fn.temperature so gradients flow into the same tensor.
+    loss_fn = ClipLoss(
+        temperature=config["anchor_temperature"],
+        learnable=config["anchor_temperature_learnable"],
+    ).to(device)
+    if config["anchor_temperature_learnable"]:
+        print("Using learnable temperature parameter")
+    temperature = loss_fn.temperature
 
     # Load checkpoint if resuming
     if config["resume_checkpoint"]:
@@ -260,13 +269,12 @@ def train_model(config, train_loader, test_loader, device):
         model.load_state_dict(checkpoint)
         start_epoch = config["resume_epoch"]
 
-    # Set up the parameters and optimizer 
-    parameters = [x for x in model.parameters()] #list(model.parameters())
-    if config["anchor_temperature_learnable"]:
-        print("Using learnable temperature parameter")
-        #parameters.append(temperature)
-        parameters = [x for x in model.parameters()]+[x for x in loss_fn.parameters()]
-    optimizer = torch.optim.Adam(parameters, lr=1e-4)
+    # Optimizer sees model params plus loss_fn params (the latter contains the
+    # temperature Parameter only when learnable=True; empty otherwise).
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(loss_fn.parameters()),
+        lr=1e-4,
+    )
     
     
     # Set up the learning rate scheduler as 20% warmup
@@ -276,7 +284,13 @@ def train_model(config, train_loader, test_loader, device):
 
     # Make a prior evaluation of the model
     print("Evaluating model before training...")
-    evaluate_model(model, test_loader, device, loss_fn=loss_fn)
+    evaluate_model(model, test_loader, device, model_name=config["model"], loss_fn=loss_fn)
+
+    # Mixed precision (AMP) setup — read fp16 flag from config
+    use_amp = bool(config.get("fp16", False)) and device.type == "cuda"
+    amp_dtype = torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    print(f"Mixed precision (fp16 AMP): {'ENABLED' if use_amp else 'disabled (running fp32)'}")
 
     # BETA init for EXP 7-8-9-10
     beta = 0.0
@@ -305,202 +319,203 @@ def train_model(config, train_loader, test_loader, device):
             #print(f"images shape: {images.shape}")
             #print(f"captions: {captions}")
 
-            #if isinstance(captions[0], int) or torch.is_tensor(captions[0]):
-            #    captions = [CIFAR10_CLASSES[label] for label in captions]
+            if isinstance(captions[0], int) or torch.is_tensor(captions[0]):
+               captions = [CIFAR10_CLASSES[label] for label in captions]
             
-            # Tokenize text
-            text_tokens = tokenizer(captions)
-            text_tokens = text_tokens.to(device)
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                # Tokenize text
+                text_tokens = tokenizer(captions)
+                text_tokens = text_tokens.to(device)
+                
+                
+    
+                # Encode image and text
+                image_embeds = model.module.encode_image(images)  # Use .module for methods inside DataParallel
+                text_embeds = model.module.encode_text(text_tokens)
+                
+                
+                image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+                text_embeds  = text_embeds  / text_embeds.norm(dim=-1, keepdim=True)
+    
+    
+                # EXP 1 AND EXP 2
+                if config["loss_type"] == "anchor":
+                    #if epoch < config["only_lunif_epochs"]:
+                    #    #print(f"Used only lunif loss for epoch {epoch}, batch {current_batch}")
+                    #    loss = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
+                    #else:
+                        #print(f"Used only anchor loss for epoch {epoch}, batch {current_batch}")
+                    #loss = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+                    loss = loss_fn(image_embeds, text_embeds)
+                
+                # EXP 3 AND EXP 5
+                elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+lunif(text)+lunif(img)":
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+                        lalign = lalign_loss(image_embeds, text_embeds)
+                        lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
+                        loss = anchor + lunif + lalign
+                
+                # EXP 4 AND EXP 6
+                elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+lunif(centroids)":
+                
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+    
+                        centroids = compute_centroids_only(image_embeds, text_embeds)
+                        centroids = F.normalize(centroids, dim=-1)
+                        lunif_centroids = lunif_loss(centroids)
+                        
+                        lalign = lalign_loss(image_embeds, text_embeds)
+    
+                        loss =  anchor + config["lambda1"] * lalign + config["lambda2"] * lunif_centroids
+    
+    
+                # EXP 7
+                elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+BETA*lunif(centroids)":
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+    
+                        lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
+                        
+                        lalign = lalign_loss(image_embeds, text_embeds)
+                        
+                        beta_warmup_epoch = config["beta_warmup_epoch"]
+                        beta_decay_epoch = config["beta_decay_epoch"]
+                        beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
+                        
+                        loss =  anchor + lalign + beta * lunif
+      
+                
+                # EXP 8
+                elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+BETA*lunif(centroids)":
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+    
+                        centroids = compute_centroids_only(image_embeds, text_embeds)
+                        centroids = F.normalize(centroids, dim=-1)
+                        lunif_centroids = lunif_loss(centroids)
+                        
+                        lalign = lalign_loss(image_embeds, text_embeds)
+                        
+                        beta_warmup_epoch = config["beta_warmup_epoch"]
+                        beta_decay_epoch = config["beta_decay_epoch"]
+                        beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
+                        
+                        loss =  anchor + lalign + beta * lunif_centroids
+    
+                # EXP 9
+                elif config["loss_type"] == "only_lunif_n_then_anchor+ALPHA*lalign+BETA*(lunif(text)+lunif(img))":
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+    
+                        lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
+                        
+                        lalign = lalign_loss(image_embeds, text_embeds)
+                        
+                        beta_warmup_epoch = config["beta_warmup_epoch"]
+                        beta_decay_epoch = config["beta_decay_epoch"]
+                        beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
+    
+                        alpha_warmup_epoch = config["alpha_warmup_epoch"]
+                        alpha_increment_epoch = config["alpha_increment_epoch"]
+    
+                        alpha = get_alpha(current_batch,t_total,alpha_warmup_epoch,alpha_increment_epoch)
+                        
+                        loss =  anchor + alpha * lalign + beta * lunif
+      
+                
+                # EXP 10
+                elif config["loss_type"] == "only_lunif_n_then_anchor+ALPHA*lalign+BETA*lunif(centroids)":
+                    if epoch < config["only_lunif_epochs"]:
+                        lunif_img = lunif_loss(image_embeds)
+                        lunif_txt = lunif_loss(text_embeds)
+                        loss = (lunif_img + lunif_txt) / 2
+                    else:
+                        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+    
+                        centroids = compute_centroids_only(image_embeds, text_embeds)
+                        centroids = F.normalize(centroids, dim=-1)
+                        lunif_centroids = lunif_loss(centroids)
+                        
+                        lalign = lalign_loss(image_embeds, text_embeds)
+                        
+                        beta_warmup_epoch = config["beta_warmup_epoch"]
+                        beta_decay_epoch = config["beta_decay_epoch"]
+                        beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
+    
+                        alpha_warmup_epoch = config["alpha_warmup_epoch"]
+                        alpha_increment_epoch = config["alpha_increment_epoch"]
+    
+                        alpha = get_alpha(current_batch,t_total,alpha_warmup_epoch,alpha_increment_epoch)
+                        
+                        loss =  anchor + alpha * lalign + beta * lunif_centroids
             
+                ###################################
+                # ABLATION STUDIES BASED ON EXP 4
+                ##################################
+                
+                # COMPLETE LOSS: ANCHOR(IMAGE,TEXT) + LALIGN(IMAGE,TEXT) + LUNIF(CENTROIDS)
+                elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LALIGN(IMAGE,TEXT)+LUNIF(CENTROIDS)":
             
-
-            # Encode image and text
-            image_embeds = model.module.encode_image(images)  # Use .module for methods inside DataParallel
-            text_embeds = model.module.encode_text(text_tokens)
-            
-            
-            image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
-            text_embeds  = text_embeds  / text_embeds.norm(dim=-1, keepdim=True)
-
-
-            # EXP 1 AND EXP 2
-            if config["loss_type"] == "anchor":
-                #if epoch < config["only_lunif_epochs"]:
-                #    #print(f"Used only lunif loss for epoch {epoch}, batch {current_batch}")
-                #    loss = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
-                #else:
-                    #print(f"Used only anchor loss for epoch {epoch}, batch {current_batch}")
-                #loss = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-                loss = loss_fn(image_embeds, text_embeds)
-            
-            # EXP 3 AND EXP 5
-            elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+lunif(text)+lunif(img)":
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
+                    anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+                    
+                    lalign = lalign_loss(image_embeds, text_embeds)
+    
+                    centroids = compute_centroids_only(image_embeds, text_embeds)
+                    centroids = F.normalize(centroids, dim=-1)
+                    lunif_centroids = lunif_loss(centroids)
+                    
+                    loss =  anchor + lalign + lunif_centroids
+                
+                # ABLATATION 1: ANCHOR(IMAGE,TEXT) + LALIGN(IMAGE,TEXT)
+                elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LALIGN(IMAGE,TEXT)":
+                    
                     anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
                     lalign = lalign_loss(image_embeds, text_embeds)
-                    lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
-                    loss = anchor + lunif + lalign
-            
-            # EXP 4 AND EXP 6
-            elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+lunif(centroids)":
-            
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
+                    
+                    loss =  anchor + lalign
+                
+                # ABLATION 2: ANCHOR(IMAGE,TEXT) + LUNIF(CENTROIDS)
+                elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LUNIF(CENTROIDS)":
+                    
                     anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-
+                    
+                    centroids = compute_centroids_only(image_embeds, text_embeds)
+                    centroids = F.normalize(centroids, dim=-1)
+                    lunif_centroids = lunif_loss(centroids)
+                    
+                    loss =  anchor + lunif_centroids   
+    
+                elif config["loss_type"] == "only_lunif_n_+lalign+lunif(centroids)":
+                    
                     centroids = compute_centroids_only(image_embeds, text_embeds)
                     centroids = F.normalize(centroids, dim=-1)
                     lunif_centroids = lunif_loss(centroids)
                     
                     lalign = lalign_loss(image_embeds, text_embeds)
-
-                    loss =  anchor + config["lambda1"] * lalign + config["lambda2"] * lunif_centroids
-
-
-            # EXP 7
-            elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+BETA*lunif(centroids)":
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
-                    anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-
-                    lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
                     
-                    lalign = lalign_loss(image_embeds, text_embeds)
-                    
-                    beta_warmup_epoch = config["beta_warmup_epoch"]
-                    beta_decay_epoch = config["beta_decay_epoch"]
-                    beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
-                    
-                    loss =  anchor + lalign + beta * lunif
-  
-            
-            # EXP 8
-            elif config["loss_type"] == "only_lunif_n_then_anchor+lalign+BETA*lunif(centroids)":
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
-                    anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-
-                    centroids = compute_centroids_only(image_embeds, text_embeds)
-                    centroids = F.normalize(centroids, dim=-1)
-                    lunif_centroids = lunif_loss(centroids)
-                    
-                    lalign = lalign_loss(image_embeds, text_embeds)
-                    
-                    beta_warmup_epoch = config["beta_warmup_epoch"]
-                    beta_decay_epoch = config["beta_decay_epoch"]
-                    beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
-                    
-                    loss =  anchor + lalign + beta * lunif_centroids
-
-            # EXP 9
-            elif config["loss_type"] == "only_lunif_n_then_anchor+ALPHA*lalign+BETA*(lunif(text)+lunif(img))":
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
-                    anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-
-                    lunif = (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
-                    
-                    lalign = lalign_loss(image_embeds, text_embeds)
-                    
-                    beta_warmup_epoch = config["beta_warmup_epoch"]
-                    beta_decay_epoch = config["beta_decay_epoch"]
-                    beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
-
-                    alpha_warmup_epoch = config["alpha_warmup_epoch"]
-                    alpha_increment_epoch = config["alpha_increment_epoch"]
-
-                    alpha = get_alpha(current_batch,t_total,alpha_warmup_epoch,alpha_increment_epoch)
-                    
-                    loss =  anchor + alpha * lalign + beta * lunif
-  
-            
-            # EXP 10
-            elif config["loss_type"] == "only_lunif_n_then_anchor+ALPHA*lalign+BETA*lunif(centroids)":
-                if epoch < config["only_lunif_epochs"]:
-                    lunif_img = lunif_loss(image_embeds)
-                    lunif_txt = lunif_loss(text_embeds)
-                    loss = (lunif_img + lunif_txt) / 2
-                else:
-                    anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-
-                    centroids = compute_centroids_only(image_embeds, text_embeds)
-                    centroids = F.normalize(centroids, dim=-1)
-                    lunif_centroids = lunif_loss(centroids)
-                    
-                    lalign = lalign_loss(image_embeds, text_embeds)
-                    
-                    beta_warmup_epoch = config["beta_warmup_epoch"]
-                    beta_decay_epoch = config["beta_decay_epoch"]
-                    beta = get_beta(current_batch,t_total,beta_warmup_epoch,beta_decay_epoch)
-
-                    alpha_warmup_epoch = config["alpha_warmup_epoch"]
-                    alpha_increment_epoch = config["alpha_increment_epoch"]
-
-                    alpha = get_alpha(current_batch,t_total,alpha_warmup_epoch,alpha_increment_epoch)
-                    
-                    loss =  anchor + alpha * lalign + beta * lunif_centroids
-        
-            ###################################
-            # ABLATION STUDIES BASED ON EXP 4
-            ##################################
-            
-            # COMPLETE LOSS: ANCHOR(IMAGE,TEXT) + LALIGN(IMAGE,TEXT) + LUNIF(CENTROIDS)
-            elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LALIGN(IMAGE,TEXT)+LUNIF(CENTROIDS)":
-        
-                anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-                
-                lalign = lalign_loss(image_embeds, text_embeds)
-
-                centroids = compute_centroids_only(image_embeds, text_embeds)
-                centroids = F.normalize(centroids, dim=-1)
-                lunif_centroids = lunif_loss(centroids)
-                
-                loss =  anchor + lalign + lunif_centroids
-            
-            # ABLATATION 1: ANCHOR(IMAGE,TEXT) + LALIGN(IMAGE,TEXT)
-            elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LALIGN(IMAGE,TEXT)":
-                
-                anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-                lalign = lalign_loss(image_embeds, text_embeds)
-                
-                loss =  anchor + lalign
-            
-            # ABLATION 2: ANCHOR(IMAGE,TEXT) + LUNIF(CENTROIDS)
-            elif config["loss_type"] == "ANCHOR(IMAGE,TEXT)+LUNIF(CENTROIDS)":
-                
-                anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
-                
-                centroids = compute_centroids_only(image_embeds, text_embeds)
-                centroids = F.normalize(centroids, dim=-1)
-                lunif_centroids = lunif_loss(centroids)
-                
-                loss =  anchor + lunif_centroids   
-
-            elif config["loss_type"] == "only_lunif_n_+lalign+lunif(centroids)":
-                
-                centroids = compute_centroids_only(image_embeds, text_embeds)
-                centroids = F.normalize(centroids, dim=-1)
-                lunif_centroids = lunif_loss(centroids)
-                
-                lalign = lalign_loss(image_embeds, text_embeds)
-                
-                loss =  lalign + lunif_centroids
+                    loss =  lalign + lunif_centroids
 
                     
             # Track useful metrics
@@ -520,27 +535,28 @@ def train_model(config, train_loader, test_loader, device):
             
             # Zero gradients
             optimizer.zero_grad()
-            
-            
-            loss.backward()
-                # Add gradient clipping
-                #torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
-            optimizer.step()
-            
+
+            # AMP-aware backward and optimizer step (no-op scaling when use_amp=False)
+            scaler.scale(loss).backward()
+            # Add gradient clipping
+            #torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
             # Update learning rate
             scheduler.step()
             
             
         
-        evaluate_model(model, test_loader, device, loss_fn=loss_fn)
-            
+        evaluate_model(model, test_loader, device, model_name=config["model"], loss_fn=loss_fn)
+
         if (epoch+1) % config["save_checkpoint_every_n_epochs"]  == 0:
-            torch.save(model.state_dict(), f"models/{config['run_name']}_epoch_{epoch+1}.pt")
+            torch.save(model.state_dict(), os.path.join(MODELS_ROOT, f"{config['run_name']}_epoch_{epoch+1}.pt"))
             print(f"Model saved at epoch {epoch+1}")
         
     return model
 
-def get_cifar10_dataloaders(cf, batch_size=128, num_workers=4, data_root='./data'):
+def get_cifar10_dataloaders(cf, batch_size=128, num_workers=4, data_root=DATA_ROOT):
     # Get the CIFAR-10 dataset and dataloaders
     
     # Define transformations
@@ -578,12 +594,12 @@ class CocoCaptionsWithIDs(dset.CocoCaptions):
 def get_coco_dataloaders(config):
 
     # Path to train images and annotations
-    train_image_dir = 'coco/images/train2017/'                          # Path to train2017 images
-    train_annotation_file = 'coco/annotations/captions_train2017.json'  # Path to train2017 captions
+    train_image_dir = os.path.join(DATA_ROOT, 'coco/images/train2017/')                          # Path to train2017 images
+    train_annotation_file = os.path.join(DATA_ROOT, 'coco/annotations/captions_train2017.json')  # Path to train2017 captions
 
     # Path to test (val) images and annotations
-    test_image_dir = 'coco/images/val2017/'                          # Path to val2017 images
-    test_annotation_file = 'coco/annotations/captions_val2017.json'  # Path to val2017 captions
+    test_image_dir = os.path.join(DATA_ROOT, 'coco/images/val2017/')                          # Path to val2017 images
+    test_annotation_file = os.path.join(DATA_ROOT, 'coco/annotations/captions_val2017.json')  # Path to val2017 captions
     
     # Fixed mean and std for the dataset
     mean = [0.48145466, 0.4578275, 0.40821073]
@@ -600,6 +616,7 @@ def get_coco_dataloaders(config):
     test_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
+        # Resize(256) + CenterCrop(224) 이렇게도 해볼 수 있음
         transforms.Normalize(mean, std)
     ])
 
@@ -663,6 +680,8 @@ def set_seed(seed: int):
 
 def main(config):
 
+    # run_name = f"{config['run_name']}_lr{config['learning_rate']}_seed{config['seed']}"
+
     # Initialize your W&B run
     wandb.init(project=config["project_name"], config=config, name=config['run_name']) #, name=f"lambda1_{config['lambda1']}_lambda2_{config['lambda2']}")
 
@@ -694,12 +713,12 @@ def main(config):
     
     # Final evaluation of the model
     print("Final evaluation of the model...")
-    final_log = evaluate_model(model, test_loader, device, loss_fn=None)
+    final_log = evaluate_model(model, test_loader, device, model_name=config["model"], loss_fn=None)
     print("Evaluation complete.\n")
     print("Final evaluation results:", final_log)
     
     # Save the model and upload it to W&B
-    torch.save(model.state_dict(), "models/" + config['run_name'] + ".pt")
+    torch.save(model.state_dict(), os.path.join(MODELS_ROOT, config['run_name'] + ".pt"))
     #wandb.save(config["run_name"] + ".pt")    
     
     wandb.finish()
@@ -716,9 +735,10 @@ if __name__ == "__main__":
         with open(args.config, 'r') as file:
             config = yaml.safe_load(file)
             # Set the device id
-
+        
         config["device_id"] = args.device
         # Convert learning rate to float
         config["learning_rate"] = float(config["learning_rate"])
+
         # Start the experiment
         main(config)

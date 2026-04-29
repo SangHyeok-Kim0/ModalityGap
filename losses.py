@@ -114,12 +114,17 @@ class LabelSmoothing(nn.Module):
         return loss.mean()
 
 class ClipLoss(nn.Module):
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.07, learnable=False):
         super().__init__()
-        # Let the temperature be a learnable parameter
-        # self.temperature = nn.Parameter(torch.tensor(temperature))
-        # Otherwise
-        self.temperature = torch.tensor(temperature)
+        # Owns the temperature scalar. When learnable, register as Parameter so
+        # it shows up in self.parameters() / state_dict() and the optimizer
+        # picks it up. Otherwise register as a buffer so .to(device) still
+        # moves it but it is not optimized.
+        t = torch.tensor(float(temperature))
+        if learnable:
+            self.temperature = nn.Parameter(t)
+        else:
+            self.register_buffer("temperature", t)
 
     def forward(self, image_features, text_features):
         # image features: [B,D]
