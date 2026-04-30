@@ -853,6 +853,16 @@ def main(config):
     run_dir, ckpt_dir, emb_dir = setup_run_dir(config["run_name"])
     print(f"Run artifacts will be saved under: {run_dir}")
 
+    # Snapshot the resolved config to run_config.json BEFORE training starts.
+    # Reason: visualization.py needs to know what dataset/model this run used.
+    # final_metrics.json is written only on successful completion, so without
+    # this snapshot a crashed/interrupted run leaves no trail and downstream
+    # tools have to fall back to project-root config.yaml (which may have been
+    # edited since). This file is the authoritative record of "what was
+    # actually launched".
+    with open(os.path.join(run_dir, "run_config.json"), "w") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
     # Load the dataset
     print(f"\nLoading the dataset {config['dataset']}...")
     if config["dataset"] == "cifar10":

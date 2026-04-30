@@ -119,24 +119,38 @@ def plot_training_curves(snapshots: List[dict], fig_dir: str):
 # ----------------------------------------------------------------------------
 
 def _load_run_config(run_dir: str) -> dict:
-    """Resolve the config used for this run.
-    Prefers runs/<name>/final_metrics.json (saved by main.py at the end of
-    training); falls back to the project-level config.yaml.
+    """Resolve the config used for this run, preferring sources in this order:
+      1. runs/<name>/run_config.json   (saved at training START — most reliable
+         even if the run crashed mid-flight)
+      2. runs/<name>/final_metrics.json's "config" field  (saved at training
+         END only — same content as run_config.json on successful runs)
+      3. project-root config.yaml      (last-resort fallback; risky because
+         it may have been edited since this run was launched)
     """
+    import json
+    run_cfg_path = os.path.join(run_dir, "run_config.json")
+    if os.path.isfile(run_cfg_path):
+        with open(run_cfg_path) as f:
+            return json.load(f)
+
     metrics_path = os.path.join(run_dir, "final_metrics.json")
     if os.path.isfile(metrics_path):
-        import json
         with open(metrics_path) as f:
             cfg = json.load(f).get("config", {})
             if cfg:
                 return cfg
+
     fallback = os.path.join(PROJECT_ROOT, "config.yaml")
     if os.path.isfile(fallback):
         import yaml
         with open(fallback) as f:
+            warnings.warn(f"No run_config.json/final_metrics.json under "
+                          f"{run_dir}; falling back to project-root config.yaml "
+                          f"— may not match the actual training config.")
             return yaml.safe_load(f)
     raise FileNotFoundError(
-        f"No final_metrics.json under {run_dir} and no config.yaml at project root.")
+        f"No run_config.json or final_metrics.json under {run_dir} "
+        f"and no config.yaml at project root.")
 
 
 def _list_available_checkpoint_epochs(ckpt_dir: str) -> List[int]:
@@ -223,13 +237,30 @@ def _build_model_with_weights(model_name: str, ckpt_path: str, device: str):
     return model
 
 
+# Class-name lookup for image-only datasets that surface labels-as-ints in the
+# loader's "captions" slot. Mirrors main.py's evaluate_model conversion.
+_CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                    'dog', 'frog', 'horse', 'ship', 'truck']
+
+
 @torch.no_grad()
 def _extract_embeddings(model, test_loader, model_name: str, device: str):
+    """Returns (img_embeds, txt_embeds, sample_ids, raw_labels) where
+    raw_labels is the un-converted second tuple element from the loader —
+    list[str] for COCO captions, list[int] for CIFAR-10 class labels.
+    Used by `plot_pca_latent_space_class` to color CIFAR-10 points without
+    re-iterating the loader."""
     import open_clip
     tokenizer = open_clip.get_tokenizer(model_name)
-    img_chunks, txt_chunks, ids = [], [], []
+    img_chunks, txt_chunks, ids, raw_labels = [], [], [], []
     for images, captions, sample_ids in test_loader:
         images = images.to(device)
+        raw_labels.extend(list(captions))
+        # Some loaders (CIFAR-10) put int class labels here; tokenizer needs
+        # strings, so look up the class name first.
+        if captions and (isinstance(captions[0], int)
+                          or torch.is_tensor(captions[0])):
+            captions = [_CIFAR10_CLASSES[int(lbl)] for lbl in captions]
         text_tokens = tokenizer(list(captions)).to(device)
         ie = model.module.encode_image(images)
         te = model.module.encode_text(text_tokens)
@@ -240,7 +271,8 @@ def _extract_embeddings(model, test_loader, model_name: str, device: str):
         ids.extend(list(sample_ids))
     return (torch.cat(img_chunks, dim=0).numpy(),
             torch.cat(txt_chunks, dim=0).numpy(),
-            ids)
+            ids,
+            raw_labels)
 
 
 def plot_pca_latent_space(run_name: str, fig_dir: str,
@@ -293,7 +325,7 @@ def plot_pca_latent_space(run_name: str, fig_dir: str,
         # Re-seed before each loader pass so caption sampling is deterministic
         # AND identical across checkpoints.
         _random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-        img, txt, _ = _extract_embeddings(model, test_loader, config["model"], device)
+        img, txt, _, _ = _extract_embeddings(model, test_loader, config["model"], device)
         gap = float(np.linalg.norm(img.mean(0) - txt.mean(0)))
         embeds[e] = (img, txt, gap)
         del model
@@ -441,9 +473,10 @@ def plot_pca_latent_space_class(run_name: str, fig_dir: str,
         return
 
     config = _load_run_config(run_dir)
-    if config.get("dataset") != "coco":
-        warnings.warn(f"plot_pca_latent_space_class only supports COCO; "
-                      f"got dataset={config.get('dataset')}. Skipping.")
+    dataset = config.get("dataset")
+    if dataset not in ("coco", "cifar10"):
+        warnings.warn(f"plot_pca_latent_space_class supports COCO and CIFAR-10; "
+                      f"got dataset={dataset}. Skipping.")
         return
     available = _list_available_checkpoint_epochs(ckpt_dir)
     if not available:
@@ -469,50 +502,57 @@ def plot_pca_latent_space_class(run_name: str, fig_dir: str,
     _random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     test_loader = _build_test_loader(config, num_samples)
 
-    # Run inference once per epoch, then apply single-object filter (same
-    # filter for every epoch since image_ids are identical → matched panels).
-    raw_embeds = {}  # epoch -> (img, txt, sample_ids)
+    # Run inference once per epoch. The loader is fixed across epochs, so
+    # sample_ids and raw_labels are identical too — only embeddings change.
+    raw_embeds = {}  # epoch -> (img, txt, sample_ids, raw_labels)
     for e in epochs:
         ckpt_path = os.path.join(ckpt_dir, f"epoch_{e:03d}.pt")
         print(f"  loading {os.path.basename(ckpt_path)} ...")
         model = _build_model_with_weights(config["model"], ckpt_path, device)
         _random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-        img, txt, sids = _extract_embeddings(model, test_loader, config["model"], device)
-        raw_embeds[e] = (img, txt, sids)
+        img, txt, sids, raw = _extract_embeddings(
+            model, test_loader, config["model"], device)
+        raw_embeds[e] = (img, txt, sids, raw)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # All epochs share sample_ids (loader is fixed), so compute the filter once.
-    _, _, sids0 = next(iter(raw_embeds.values()))
-    res = _filter_single_object_coco(raw_embeds[epochs[0]][0],
-                                     raw_embeds[epochs[0]][1], sids0)
-    if res is None:
-        warnings.warn("No single-object images survived the filter; skipping.")
-        return
-    _, _, labels_int, label_names = res
+    _, _, sids0, raw0 = next(iter(raw_embeds.values()))
+
+    if dataset == "coco":
+        # COCO: filter to single-object images via instances_val2017.json.
+        res = _filter_single_object_coco(raw_embeds[epochs[0]][0],
+                                         raw_embeds[epochs[0]][1], sids0)
+        if res is None:
+            warnings.warn("No single-object images survived the filter; skipping.")
+            return
+        _, _, labels_int, label_names = res
+        # Re-derive the keep_idx (in original order) so we can apply it to
+        # every epoch's embeddings.
+        import contextlib, io as _io
+        with contextlib.redirect_stdout(_io.StringIO()):
+            from pycocotools.coco import COCO
+            coco = COCO(os.path.join(PROJECT_ROOT, "data",
+                                     "coco/annotations/instances_val2017.json"))
+        keep_idx_list = []
+        for i, sid in enumerate(sids0):
+            anns = coco.loadAnns(coco.getAnnIds(imgIds=int(sid)))
+            cats = {a["category_id"] for a in anns}
+            if len(cats) == 1:
+                keep_idx_list.append(i)
+        keep_idx = np.asarray(keep_idx_list, dtype=np.int64)
+        print(f"  single-object filter kept {len(keep_idx)} / {len(sids0)} "
+              f"images across {len(label_names)} classes")
+    else:  # cifar10
+        # CIFAR-10 already has clean class labels per sample; no filter needed.
+        labels_int = np.asarray([int(c) for c in raw0], dtype=np.int64)
+        label_names = list(_CIFAR10_CLASSES)
+        keep_idx = np.arange(len(labels_int), dtype=np.int64)
+        print(f"  cifar10: using all {len(labels_int)} samples "
+              f"across {len(label_names)} classes")
+
     n_classes = len(label_names)
     palette = _make_class_palette(n_classes)
-    print(f"  single-object filter kept {len(labels_int)} / {len(sids0)} images "
-          f"across {n_classes} classes")
-
-    # Re-apply the SAME index mask to every epoch's embeddings (ids are fixed).
-    keep_idx_mask = np.zeros(len(sids0), dtype=bool)
-    sid_to_pos = {sid: pos for pos, sid in enumerate(sids0)}
-    # We need the keep indices in the original order. Re-derive from the filter.
-    keep_idx_list = []
-    import contextlib, io as _io
-    buf = _io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        from pycocotools.coco import COCO
-        coco = COCO(os.path.join(PROJECT_ROOT, "data",
-                                 "coco/annotations/instances_val2017.json"))
-    for i, sid in enumerate(sids0):
-        anns = coco.loadAnns(coco.getAnnIds(imgIds=int(sid)))
-        cats = {a["category_id"] for a in anns}
-        if len(cats) == 1:
-            keep_idx_list.append(i)
-    keep_idx = np.asarray(keep_idx_list, dtype=np.int64)
 
     filt_embeds = {e: (raw_embeds[e][0][keep_idx], raw_embeds[e][1][keep_idx])
                    for e in epochs}
