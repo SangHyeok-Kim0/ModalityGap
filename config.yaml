@@ -3,16 +3,16 @@
 # with temperature as a learnable parameter.
 
 # Identifiers
-project_name: "modality_gap_cifar10"
-run_name: "Test"
+project_name: "modality_gap"
+run_name: auto   # 'auto' / null / "" → {dataset}_{model}_{YYYYMMDD-HHMMSS}; or set explicitly e.g. "MyRun"
 
 # Never change parameters
 seed: 42
 learning_rate: 1e-4
 batch_size: 256
-model: "RN50"
+model: "ViT-B-32"
 num_train_samples: -1
-num_test_samples: -1
+num_test_samples: 2048
 epochs: 100
 
 # Experiment specific parameters
@@ -20,7 +20,7 @@ loss_type: "only_lunif_n_then_anchor+ALPHA*lalign+BETA*lunif(centroids)"
 only_lunif_epochs: 0
 anchor_temperature: 0.1
 anchor_temperature_learnable: false
-dataset: 'cifar10'
+dataset: 'coco'
 
 # Evaluation and checkpointing
 save_checkpoint_every_n_epochs: 20

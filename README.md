@@ -73,6 +73,8 @@ python Code/ModalityGap/main.py --config Code/ModalityGap/config.yaml --device 0
 
 `--device` is the GPU id. Multi-GPU is automatic via `DataParallel` — set `CUDA_VISIBLE_DEVICES` to control which GPUs participate. WandB must be authenticated beforehand (`wandb login`). Paths inside the script are resolved from `__file__`, so you can launch from any CWD. Datasets are expected under `Code/ModalityGap/data/` (COCO under `data/coco/`, CIFAR-10 under `data/cifar-10-batches-py/`).
 
+`run_name` accepts `auto` (or `null` / empty) to auto-generate `{dataset}_{model}_{YYYYMMDD-HHMMSS}` per launch — useful for back-to-back runs without manually editing the config. Set it to a string (e.g. `"MyRun"`) to override.
+
 #### 2. Outputs
 
 All artifacts for a run land under `Code/ModalityGap/runs/{run_name}/` (git-ignored):
@@ -97,12 +99,15 @@ WandB panels are auto-grouped by metric prefix:
 | Section | Keys |
 |---|---|
 | `loss/`        | `loss/total`, `loss/anchor`, `loss/lalign`, `loss/lunif_centroids` |
+| `val_loss/`    | `val_loss/{anchor, lalign, lunif_centroids, total_unweighted}` (per epoch) |
 | `grad_norm/`   | `grad_norm/{anchor,lalign,lunif_centroids}` (every N steps) |
 | `optim/`       | `optim/learning_rate` (+ `optim/temperature` if learnable) |
 | `loss_weight/` | `loss_weight/alpha`, `loss_weight/beta` |
 | `retrieval/`   | `retrieval/{forward,backward}_r{1,5,10,ravg}` |
 | `embedding/`   | `embedding/{gap, uniformity, mean_angular_value_image, mean_angular_value_text, mean_cosine_similarity_true_pairs}` |
 | `clustering/`  | `clustering/{ARI, NMI, Homogeneity, V-measure, Max Linear Probe Acc, K-NN Acc}` |
+
+`val_loss/*` is computed per-batch on the validation set (averaged across batches), mirroring `loss/*` from training. `total_unweighted = anchor + lalign + lunif_centroids` (no α/β scheduling) so it stays comparable across epochs.
 
 #### 3. Visualize
 

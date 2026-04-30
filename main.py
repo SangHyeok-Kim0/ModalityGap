@@ -123,12 +123,32 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
 
     all_captions = []  # capture the (string) captions actually fed to the encoder
 
+    # Validation loss accumulator. Each component averaged over batches so the
+    # scale matches train_loss (which is also a per-batch quantity). We only
+    # log the components that the current loss_type actually trains on
+    # (anchor + lalign + lunif_centroids); per-modality lunif is omitted
+    # because (a) it isn't part of the main-phase loss and (b) its info is
+    # already covered by `embedding/mean_angular_value_*`.
+    val_loss_acc = {"anchor": 0.0, "lalign": 0.0,
+                    "lunif_centroids": 0.0, "n_batches": 0}
+    # Reuse trained loss_fn (with its learned temperature if applicable);
+    # otherwise build a fresh one from config so val loss is still computable
+    # at the post-training full-val eval site (which currently passes None).
+    if loss_fn is None:
+        _loss_fn_eval = ClipLoss(
+            temperature=config["anchor_temperature"],
+            learnable=False,
+        ).to(device)
+        eval_temperature = _loss_fn_eval.temperature
+    else:
+        eval_temperature = loss_fn.temperature
+
     # No gradient needed during evaluation
     with torch.no_grad():
         for images, captions_list, sample_ids in (tqdm(test_loader, desc="Evaluating") if plot_embeddings else test_loader):
             # Move images to device
             images = images.to(device)
-            
+
             # Convert numerical labels to text class names (only for CIFAR-10)
             if isinstance(captions_list[0], int) or torch.is_tensor(captions_list[0]):
                 # Convert numeric label to textual class name
@@ -144,10 +164,23 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
             # Tokenize captions
             all_captions.extend(list(captions_list))
             text_tokens = tokenizer(captions_list).to(device)
-            
+
             # Extract embeddings using the .module references in DataParallel
             image_embeds = model.module.encode_image(images)
             text_embeds = model.module.encode_text(text_tokens)
+
+            # ---- validation loss (per-batch, mirrors train_loss components) ----
+            ie_n = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
+            te_n = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+            anchor_b = contrastive_loss(ie_n, te_n, temperature=eval_temperature)
+            lalign_b = lalign_loss(ie_n, te_n)
+            cent_b = compute_centroids_only(ie_n, te_n)
+            cent_b = F.normalize(cent_b, dim=-1)
+            lunif_cent_b = lunif_loss(cent_b)
+            val_loss_acc["anchor"]          += anchor_b.item()
+            val_loss_acc["lalign"]          += lalign_b.item()
+            val_loss_acc["lunif_centroids"] += lunif_cent_b.item()
+            val_loss_acc["n_batches"]       += 1
 
             # Move embeddings to CPU for later concatenation
             image_embeds = image_embeds.cpu()
@@ -240,6 +273,20 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
     #    log_forward, log_backward, gap, mean_ang_image, mean_ang_text, uniformity_metric, mean_cos_true_pairs = metrics.result()
     log_forward, log_backward, gap, mean_ang_image, mean_ang_text, uniformity_metric, mean_cos_true_pairs, clustering_metrics = compute_metrics(all_image_embeds, all_text_embeds, similarity_matrix, ids_img, ids_txt)
 
+    # Average per-batch validation loss components.
+    n = max(val_loss_acc["n_batches"], 1)
+    val_loss_log = {
+        "val_loss/anchor":          round(val_loss_acc["anchor"]          / n, 6),
+        "val_loss/lalign":          round(val_loss_acc["lalign"]          / n, 6),
+        "val_loss/lunif_centroids": round(val_loss_acc["lunif_centroids"] / n, 6),
+        # Unweighted total (anchor + lalign + lunif_centroids) for a clean
+        # apples-to-apples comparison vs train loss/total — without the per-step
+        # alpha/beta scheduling that would obscure the trend.
+        "val_loss/total_unweighted": round(
+            (val_loss_acc["anchor"] + val_loss_acc["lalign"]
+             + val_loss_acc["lunif_centroids"]) / n, 6),
+    }
+
     # Combine all metrics into final_log
     final_log = {
         **log_forward,
@@ -250,7 +297,8 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
         'uniformity': round(uniformity_metric, 4),
         'mean_cosine_similarity_true_pairs': round(mean_cos_true_pairs, 4),
 
-        **clustering_metrics
+        **clustering_metrics,
+        **val_loss_log,
     }
 
     if plot_embeddings:
@@ -286,6 +334,8 @@ def evaluate_model(model: torch.nn.Module, test_loader: DataLoader, device: torc
     _embed_keys = {"gap", "uniformity", "mean_angular_value_image",
                    "mean_angular_value_text", "mean_cosine_similarity_true_pairs"}
     def _wandb_key(k: str) -> str:
+        if "/" in k:
+            return k  # already prefixed (e.g. val_loss/anchor) → pass through
         if k.startswith("forward_") or k.startswith("backward_"):
             return f"retrieval/{k}"
         if k in _embed_keys:
@@ -830,7 +880,14 @@ def set_seed(seed: int):
 
 def main(config):
 
-    # run_name = f"{config['run_name']}_lr{config['learning_rate']}_seed{config['seed']}"
+    # Resolve run_name. If left as null/empty/"auto" in config.yaml, generate
+    # `{dataset}_{model}_{YYYYMMDD-HHMMSS}` so each launch gets a unique
+    # directory under runs/ without manual edits.
+    if config.get("run_name") in (None, "", "auto"):
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        config["run_name"] = f"{config['dataset']}_{config['model']}_{ts}"
+        print(f"Auto-generated run_name: {config['run_name']}")
 
     # Initialize your W&B run
     wandb.init(project=config["project_name"], config=config, name=config['run_name']) #, name=f"lambda1_{config['lambda1']}_lambda2_{config['lambda2']}")
