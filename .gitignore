@@ -15,5 +15,6 @@ data/
 # experiment outputs
 outputs/
 checkpoints/
+runs/
 *.pt
 *.pth

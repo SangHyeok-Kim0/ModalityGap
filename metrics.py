@@ -1,7 +1,9 @@
+import contextlib
+import io
 import os
 import torch
 from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_score, accuracy_score, classification_report
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, homogeneity_score, accuracy_score
 from sklearn.metrics import v_measure_score
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -9,6 +11,13 @@ import torch.nn as nn
 from sklearn.neighbors import KNeighborsClassifier
 import math
 from typing import List, Dict
+
+
+@contextlib.contextmanager
+def _silence_stdout():
+    """Suppress stdout — used to mute pycocotools' verbose loading messages."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(PROJECT_ROOT, 'data')
@@ -33,8 +42,12 @@ def compute_metric_ret(score_matrix: torch.Tensor, ids: List[int], ids_txt: List
         indice_matrix = score_matrix.sort(dim=-1, descending=True)[1].tolist()
         rank = []
         for i in range(len(ids_txt)):
-            gt_indice = ids.index(ids_txt[i])
-            rank.append(indice_matrix[i].index(gt_indice))
+            # Multi-positive: every image whose id matches counts as correct.
+            # For COCO (unique ids) this is exactly one match, so behavior is
+            # unchanged. For CIFAR-10 (ids = class labels) every same-class
+            # image counts → metric becomes class-level R@K.
+            gt_indices = [j for j, id_img in enumerate(ids) if id_img == ids_txt[i]]
+            rank.append(min(indice_matrix[i].index(j) for j in gt_indices))
 
         rank = torch.tensor(rank).to(score_matrix.device)
 
@@ -74,61 +87,46 @@ def compute_metric_ret(score_matrix: torch.Tensor, ids: List[int], ids_txt: List
 
     return eval_log
 
-def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor, ids_txt) :
-    from pycocotools.coco import COCO
+def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor,
+                                ids_txt, dataset: str = "coco",
+                                labels=None):
+    """Compute clustering / linear-probe / k-NN metrics.
 
-    # File paths
-    instances_path = os.path.join(DATA_ROOT, 'coco/annotations/instances_val2017.json')
-    captions_path = os.path.join(DATA_ROOT, 'coco/annotations/captions_val2017.json')
-
-    true_labels = []
-
-    # Load COCO APIs
-    coco_instances = COCO(instances_path)
-    coco_captions = COCO(captions_path)
-
-
-    print(f'feat_t shape: {feat_t.shape}')
-    print(f'feat_v shape: {feat_v.shape}')
-
-    feat_t_new = []
-    feat_v_new = []
-
-    for i, id in enumerate(ids_txt):
-        print(id)
-
-        # --- Retrieve OBJECTS ---
-        ann_ids = coco_instances.getAnnIds(imgIds=id)
-        anns = coco_instances.loadAnns(ann_ids)
-
-
-        local_ids = set([ann['category_id'] for ann in anns])
-        local_labels = []
-        #for local_id in local_ids:
-        #    store = 0
-        #    
-        #    if local_id in categories_id:
-    #
-        #        local_labels.append(local_id)
-
-        if len(local_ids) == 1:
-            true_labels.append(list(local_ids)[0])
-            feat_t_new.append(feat_t[i])
-            feat_v_new.append(feat_v[i])
-        else:
-            print("More than one object in image", id, ":", local_ids)
-            # If you want to handle multiple objects, you can modify this logic
-            # For now, we skip this image
-            continue
-
-
-
-    feat_t_new = torch.stack(feat_t_new)
-    feat_v_new = torch.stack(feat_v_new)
-
-    print(f'feat_t_new shape: {feat_t_new.shape}')
-    print(f'feat_v_new shape: {feat_v_new.shape}')
-    print("True labels:", true_labels)
+    Two paths:
+    * COCO: load `instances_val2017.json`, keep images with exactly one object
+      category, use that category as the class label (existing behavior).
+    * CIFAR10 (or any dataset where per-sample labels are already known): pass
+      `labels` (1-D array, len == feat_t.shape[0]) and skip the COCO filter.
+    """
+    if dataset == "cifar10" or labels is not None:
+        if labels is None:
+            raise ValueError(
+                "labels must be provided for non-COCO datasets")
+        true_labels = list(map(int, labels))
+        feat_t_new = feat_t if torch.is_tensor(feat_t) else torch.as_tensor(feat_t)
+        feat_v_new = feat_v if torch.is_tensor(feat_v) else torch.as_tensor(feat_v)
+    else:
+        from pycocotools.coco import COCO
+        instances_path = os.path.join(
+            DATA_ROOT, 'coco/annotations/instances_val2017.json')
+        true_labels = []
+        with _silence_stdout():
+            coco_instances = COCO(instances_path)
+        feat_t_new, feat_v_new = [], []
+        n_skipped_multilabel = 0
+        for i, id in enumerate(ids_txt):
+            ann_ids = coco_instances.getAnnIds(imgIds=id)
+            anns = coco_instances.loadAnns(ann_ids)
+            local_ids = set([ann['category_id'] for ann in anns])
+            if len(local_ids) == 1:
+                true_labels.append(list(local_ids)[0])
+                feat_t_new.append(feat_t[i])
+                feat_v_new.append(feat_v[i])
+            else:
+                n_skipped_multilabel += 1
+                continue
+        feat_t_new = torch.stack(feat_t_new)
+        feat_v_new = torch.stack(feat_v_new)
 
 
 
@@ -146,9 +144,6 @@ def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor, ids_t
 
 
     v = v_measure_score(true_labels_new, cluster_labels)
-
-    print(f"ARI: {ari:.4f}, NMI: {nmi:.4f}, Homogeneity: {hom:.4f}, V-measure: {v:.4f}")
-
 
     embeddings = torch.vstack((feat_t_new, feat_v_new))
     # Get unique labels and create mapping to consecutive integers
@@ -235,10 +230,6 @@ def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor, ids_t
     knn.fit(X_train, y_train)
     knn_preds = knn.predict(X_test)
     knn_acc = accuracy_score(y_test, knn_preds)
-
-    print("\nK-NN Classification Report:")
-    print(classification_report(y_test, knn_preds))
-    print(f"max accuracy: {max(test_accuracies)}")
 
     return {
         "ARI": ari,
