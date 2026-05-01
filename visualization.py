@@ -17,7 +17,7 @@ import argparse
 import glob
 import os
 import warnings
-from typing import Dict, List
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -165,7 +165,7 @@ def _list_available_checkpoint_epochs(ckpt_dir: str) -> List[int]:
 
 
 def _build_test_loader(config: dict, num_samples: int):
-    """Build a fresh test loader with `num_samples` samples.
+    """Build a fresh COCO test loader with `num_samples` samples.
 
     Built inline (rather than reused from main.py's `get_coco_dataloaders`) so
     we can set `drop_last=False`. The training pipeline's loader uses
@@ -181,17 +181,6 @@ def _build_test_loader(config: dict, num_samples: int):
     DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
     mean = [0.48145466, 0.4578275, 0.40821073]
     std  = [0.26862954, 0.26130258, 0.27577711]
-
-    if config.get("dataset") != "coco":
-        # Defer to main.py for non-coco datasets (cifar10).
-        import sys
-        if PROJECT_ROOT not in sys.path:
-            sys.path.insert(0, PROJECT_ROOT)
-        from main import get_cifar10_dataloaders
-        cfg = dict(config); cfg["num_test_samples"] = int(num_samples)
-        cfg.setdefault("device_id", 0)
-        _, test_loader = get_cifar10_dataloaders(cfg)
-        return test_loader
 
     test_image_dir = os.path.join(DATA_ROOT, "coco/images/val2017/")
     test_annotation_file = os.path.join(DATA_ROOT, "coco/annotations/captions_val2017.json")
@@ -237,30 +226,15 @@ def _build_model_with_weights(model_name: str, ckpt_path: str, device: str):
     return model
 
 
-# Class-name lookup for image-only datasets that surface labels-as-ints in the
-# loader's "captions" slot. Mirrors main.py's evaluate_model conversion.
-_CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-                    'dog', 'frog', 'horse', 'ship', 'truck']
-
-
 @torch.no_grad()
 def _extract_embeddings(model, test_loader, model_name: str, device: str):
-    """Returns (img_embeds, txt_embeds, sample_ids, raw_labels) where
-    raw_labels is the un-converted second tuple element from the loader —
-    list[str] for COCO captions, list[int] for CIFAR-10 class labels.
-    Used by `plot_pca_latent_space_class` to color CIFAR-10 points without
-    re-iterating the loader."""
+    """Returns (img_embeds, txt_embeds, sample_ids, raw_captions)."""
     import open_clip
     tokenizer = open_clip.get_tokenizer(model_name)
-    img_chunks, txt_chunks, ids, raw_labels = [], [], [], []
+    img_chunks, txt_chunks, ids, raw_captions = [], [], [], []
     for images, captions, sample_ids in test_loader:
         images = images.to(device)
-        raw_labels.extend(list(captions))
-        # Some loaders (CIFAR-10) put int class labels here; tokenizer needs
-        # strings, so look up the class name first.
-        if captions and (isinstance(captions[0], int)
-                          or torch.is_tensor(captions[0])):
-            captions = [_CIFAR10_CLASSES[int(lbl)] for lbl in captions]
+        raw_captions.extend(list(captions))
         text_tokens = tokenizer(list(captions)).to(device)
         ie = model.module.encode_image(images)
         te = model.module.encode_text(text_tokens)
@@ -272,7 +246,7 @@ def _extract_embeddings(model, test_loader, model_name: str, device: str):
     return (torch.cat(img_chunks, dim=0).numpy(),
             torch.cat(txt_chunks, dim=0).numpy(),
             ids,
-            raw_labels)
+            raw_captions)
 
 
 def plot_pca_latent_space(run_name: str, fig_dir: str,
@@ -473,11 +447,6 @@ def plot_pca_latent_space_class(run_name: str, fig_dir: str,
         return
 
     config = _load_run_config(run_dir)
-    dataset = config.get("dataset")
-    if dataset not in ("coco", "cifar10"):
-        warnings.warn(f"plot_pca_latent_space_class supports COCO and CIFAR-10; "
-                      f"got dataset={dataset}. Skipping.")
-        return
     available = _list_available_checkpoint_epochs(ckpt_dir)
     if not available:
         warnings.warn(f"No epoch_*.pt under {ckpt_dir}; skipping.")
@@ -517,39 +486,31 @@ def plot_pca_latent_space_class(run_name: str, fig_dir: str,
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    _, _, sids0, raw0 = next(iter(raw_embeds.values()))
+    _, _, sids0, _ = next(iter(raw_embeds.values()))
 
-    if dataset == "coco":
-        # COCO: filter to single-object images via instances_val2017.json.
-        res = _filter_single_object_coco(raw_embeds[epochs[0]][0],
-                                         raw_embeds[epochs[0]][1], sids0)
-        if res is None:
-            warnings.warn("No single-object images survived the filter; skipping.")
-            return
-        _, _, labels_int, label_names = res
-        # Re-derive the keep_idx (in original order) so we can apply it to
-        # every epoch's embeddings.
-        import contextlib, io as _io
-        with contextlib.redirect_stdout(_io.StringIO()):
-            from pycocotools.coco import COCO
-            coco = COCO(os.path.join(PROJECT_ROOT, "data",
-                                     "coco/annotations/instances_val2017.json"))
-        keep_idx_list = []
-        for i, sid in enumerate(sids0):
-            anns = coco.loadAnns(coco.getAnnIds(imgIds=int(sid)))
-            cats = {a["category_id"] for a in anns}
-            if len(cats) == 1:
-                keep_idx_list.append(i)
-        keep_idx = np.asarray(keep_idx_list, dtype=np.int64)
-        print(f"  single-object filter kept {len(keep_idx)} / {len(sids0)} "
-              f"images across {len(label_names)} classes")
-    else:  # cifar10
-        # CIFAR-10 already has clean class labels per sample; no filter needed.
-        labels_int = np.asarray([int(c) for c in raw0], dtype=np.int64)
-        label_names = list(_CIFAR10_CLASSES)
-        keep_idx = np.arange(len(labels_int), dtype=np.int64)
-        print(f"  cifar10: using all {len(labels_int)} samples "
-              f"across {len(label_names)} classes")
+    # COCO: filter to single-object images via instances_val2017.json.
+    res = _filter_single_object_coco(raw_embeds[epochs[0]][0],
+                                     raw_embeds[epochs[0]][1], sids0)
+    if res is None:
+        warnings.warn("No single-object images survived the filter; skipping.")
+        return
+    _, _, labels_int, label_names = res
+    # Re-derive the keep_idx (in original order) so we can apply it to
+    # every epoch's embeddings.
+    import contextlib, io as _io
+    with contextlib.redirect_stdout(_io.StringIO()):
+        from pycocotools.coco import COCO
+        coco = COCO(os.path.join(PROJECT_ROOT, "data",
+                                 "coco/annotations/instances_val2017.json"))
+    keep_idx_list = []
+    for i, sid in enumerate(sids0):
+        anns = coco.loadAnns(coco.getAnnIds(imgIds=int(sid)))
+        cats = {a["category_id"] for a in anns}
+        if len(cats) == 1:
+            keep_idx_list.append(i)
+    keep_idx = np.asarray(keep_idx_list, dtype=np.int64)
+    print(f"  single-object filter kept {len(keep_idx)} / {len(sids0)} "
+          f"images across {len(label_names)} classes")
 
     n_classes = len(label_names)
     palette = _make_class_palette(n_classes)

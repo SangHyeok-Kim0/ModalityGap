@@ -42,10 +42,6 @@ def compute_metric_ret(score_matrix: torch.Tensor, ids: List[int], ids_txt: List
         indice_matrix = score_matrix.sort(dim=-1, descending=True)[1].tolist()
         rank = []
         for i in range(len(ids_txt)):
-            # Multi-positive: every image whose id matches counts as correct.
-            # For COCO (unique ids) this is exactly one match, so behavior is
-            # unchanged. For CIFAR-10 (ids = class labels) every same-class
-            # image counts → metric becomes class-level R@K.
             gt_indices = [j for j, id_img in enumerate(ids) if id_img == ids_txt[i]]
             rank.append(min(indice_matrix[i].index(j) for j in gt_indices))
 
@@ -87,48 +83,29 @@ def compute_metric_ret(score_matrix: torch.Tensor, ids: List[int], ids_txt: List
 
     return eval_log
 
-def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor,
-                                ids_txt, dataset: str = "coco",
-                                labels=None):
-    """Compute clustering / linear-probe / k-NN metrics.
+def compute_clustering_metrics(feat_t: torch.Tensor, feat_v: torch.Tensor, ids_txt):
+    """Compute clustering / linear-probe / k-NN metrics on COCO val2017.
 
-    Two paths:
-    * COCO: load `instances_val2017.json`, keep images with exactly one object
-      category, use that category as the class label (existing behavior).
-    * CIFAR10 (or any dataset where per-sample labels are already known): pass
-      `labels` (1-D array, len == feat_t.shape[0]) and skip the COCO filter.
+    Loads `instances_val2017.json`, keeps only images with exactly one distinct
+    object category, and uses that category as the class label.
     """
-    if dataset == "cifar10" or labels is not None:
-        if labels is None:
-            raise ValueError(
-                "labels must be provided for non-COCO datasets")
-        true_labels = list(map(int, labels))
-        feat_t_new = feat_t if torch.is_tensor(feat_t) else torch.as_tensor(feat_t)
-        feat_v_new = feat_v if torch.is_tensor(feat_v) else torch.as_tensor(feat_v)
-    else:
-        from pycocotools.coco import COCO
-        instances_path = os.path.join(
-            DATA_ROOT, 'coco/annotations/instances_val2017.json')
-        true_labels = []
-        with _silence_stdout():
-            coco_instances = COCO(instances_path)
-        feat_t_new, feat_v_new = [], []
-        n_skipped_multilabel = 0
-        for i, id in enumerate(ids_txt):
-            ann_ids = coco_instances.getAnnIds(imgIds=id)
-            anns = coco_instances.loadAnns(ann_ids)
-            local_ids = set([ann['category_id'] for ann in anns])
-            if len(local_ids) == 1:
-                true_labels.append(list(local_ids)[0])
-                feat_t_new.append(feat_t[i])
-                feat_v_new.append(feat_v[i])
-            else:
-                n_skipped_multilabel += 1
-                continue
-        feat_t_new = torch.stack(feat_t_new)
-        feat_v_new = torch.stack(feat_v_new)
-
-
+    from pycocotools.coco import COCO
+    instances_path = os.path.join(
+        DATA_ROOT, 'coco/annotations/instances_val2017.json')
+    true_labels = []
+    with _silence_stdout():
+        coco_instances = COCO(instances_path)
+    feat_t_new, feat_v_new = [], []
+    for i, id in enumerate(ids_txt):
+        ann_ids = coco_instances.getAnnIds(imgIds=id)
+        anns = coco_instances.loadAnns(ann_ids)
+        local_ids = set([ann['category_id'] for ann in anns])
+        if len(local_ids) == 1:
+            true_labels.append(list(local_ids)[0])
+            feat_t_new.append(feat_t[i])
+            feat_v_new.append(feat_v[i])
+    feat_t_new = torch.stack(feat_t_new)
+    feat_v_new = torch.stack(feat_v_new)
 
     kmeans = KMeans(n_clusters=10, random_state=0)
     cluster_labels = kmeans.fit_predict(torch.vstack((feat_t_new, feat_v_new)))
@@ -309,26 +286,6 @@ def uniformity(features_modality1: torch.Tensor, features_modality2: torch.Tenso
     part2 = np.trace(np_covariance - 2.0/np.sqrt(dim) * covariance_2)
     wasserstein_distance = math.sqrt(part1 + 1 + part2)
     return -wasserstein_distance 
-
-def centroid_alignment_loss(img_embeds: torch.Tensor, txt_embeds: torch.Tensor, p=2) -> torch.Tensor:
-    """
-    Compute the distance between the mean image embedding and the mean text embedding.
-
-    Args:
-        img_embeds (torch.Tensor): Image embeddings of shape (batch_size, embed_dim).
-        txt_embeds (torch.Tensor): Text embeddings of shape (batch_size, embed_dim).
-        p (int): Norm order (2 for Euclidean / L2 norm).
-
-    Returns:
-        torch.Tensor: A scalar tensor representing the centroid alignment penalty.
-    """
-    # Compute centroids along the batch dimension
-    centroid_img = img_embeds.mean(dim=0)  # shape (embed_dim,)
-    centroid_txt = txt_embeds.mean(dim=0)  # shape (embed_dim,)
-
-    # Compute the L2 distance (default) between the centroids
-    dist = torch.norm(centroid_img - centroid_txt, p=p)
-    return dist
 
 def mean_distance_of_true_pairs(features_modality1: torch.Tensor, features_modality2: torch.Tensor, cosine = True) -> float:
     """

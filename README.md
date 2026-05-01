@@ -18,23 +18,11 @@ The modality gap is irrelevant for instance-wise tasks, such as retrieval, which
 To close the gap, we propose a combination of losses, coded as:
 
 ```python
-def compute_centroids_only(text_embeddings, visual_embeddings):
+def compute_centroids(text_embeddings, visual_embeddings):
+    """Element-wise centroid for each (text_i, visual_i) pair: mean of the
+    two embeddings. Returns a tensor of shape (batch_size, feature_dim).
     """
-    Computes the centroid for each pair of samples between text embeddings and visual embeddings
-    by calculating the mean of the corresponding feature vectors across the two modalities.
-
-    Parameters:
-    - text_embeddings (torch.Tensor): Tensor of shape (batch_size1, feature_dim) representing text embeddings.
-    - visual_embeddings (torch.Tensor): Tensor of shape (batch_size2, feature_dim) representing visual embeddings.
-
-    Returns:
-    - torch.Tensor: Tensor of shape (batch_size1, batch_size2, feature_dim) representing the centroid for each pair.
-    """
-
-    # Compute centroids by averaging text and visual embeddings
-    centroids = (text_embeddings + visual_embeddings) / 2.0
-
-    return  centroids
+    return (text_embeddings + visual_embeddings) / 2.0
 
 def lalign_loss(x, y, alpha=2):
     return (x - y).norm(dim=1).pow(alpha).mean()
@@ -42,7 +30,7 @@ def lalign_loss(x, y, alpha=2):
 def lunif_loss(x, t=2):
     # Compute pairwise distances between all embeddings
     sq_pdist = torch.pdist(x, p=2).pow(2)
-    
+
     # Apply the uniformity loss formula
     return sq_pdist.mul(-t).exp().mean().log()
 
@@ -50,12 +38,12 @@ def lunif_loss(x, t=2):
 
 # in the training loop, after computing the image and text embeddings:
 # ...
-anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature) 
+anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
 
-centroids = compute_centroids_only(image_embeds, text_embeds)
+centroids = compute_centroids(image_embeds, text_embeds)
 centroids = F.normalize(centroids, dim=-1)
 lunif_centroids = lunif_loss(centroids)
-                        
+
 lalign = lalign_loss(image_embeds, text_embeds)
 loss =  anchor + config["lambda1"] * lalign + config["lambda2"] * lunif_centroids
 # ...
@@ -71,9 +59,9 @@ Configure your `config.yaml` (`run_name`, `loss_type`, `dataset`, scheduler knob
 python Code/ModalityGap/main.py --config Code/ModalityGap/config.yaml --device 0
 ```
 
-`--device` is the GPU id. Multi-GPU is automatic via `DataParallel` — set `CUDA_VISIBLE_DEVICES` to control which GPUs participate. WandB must be authenticated beforehand (`wandb login`). Paths inside the script are resolved from `__file__`, so you can launch from any CWD. Datasets are expected under `Code/ModalityGap/data/` (COCO under `data/coco/`, CIFAR-10 under `data/cifar-10-batches-py/`).
+`--device` is the GPU id. Multi-GPU is automatic via `DataParallel` — set `CUDA_VISIBLE_DEVICES` to control which GPUs participate. WandB must be authenticated beforehand (`wandb login`). Paths inside the script are resolved from `__file__`, so you can launch from any CWD. The COCO dataset is expected under `Code/ModalityGap/data/coco/`.
 
-`run_name` accepts `auto` (or `null` / empty) to auto-generate `{dataset}_{model}_{YYYYMMDD-HHMMSS}` per launch — useful for back-to-back runs without manually editing the config. Set it to a string (e.g. `"MyRun"`) to override.
+`run_name` accepts `auto` (or `null` / empty) to auto-generate `coco_{model}_{YYYYMMDD-HHMMSS}` per launch — useful for back-to-back runs without manually editing the config. Set it to a string (e.g. `"MyRun"`) to override.
 
 #### 2. Outputs
 
@@ -123,14 +111,12 @@ Generates four figures under `runs/{run_name}/figures/`:
 |---|---|---|
 | `curves`     | `training_curves.png`         | per-epoch snapshots in `embeddings/` |
 | `pca`        | `pca_latent_space.png`        | post-hoc inference from `checkpoints/` |
-| `pca_class`  | `pca_latent_space_class.png`  | post-hoc inference + class labels (COCO single-object filter or CIFAR-10 native classes) |
+| `pca_class`  | `pca_latent_space_class.png`  | post-hoc inference + class labels (COCO single-object filter) |
 | `histogram`  | `pair_distance_histogram.png` | per-epoch snapshots in `embeddings/` |
 
 `curves` and `histogram` read the per-epoch snapshots in `embeddings/`. `pca` and `pca_class` are **decoupled** from snapshots: they load `checkpoints/epoch_NNN.pt` post-hoc, run fresh inference at the requested `--pca_num_samples`, then project to 3D and onto the unit sphere (3 view angles × N selected epochs). This means you can pick any sample count after training without re-running it — but the requested `--pca_epochs` must match an actually-saved checkpoint.
 
-`pca_class` is a variant of `pca` that **colors points by class and shapes by modality** (image=square `s`, text=star `*`, marker convention borrowed from TempModGap). The class label source depends on the dataset:
-- **COCO**: `instances_val2017.json` via the single-object filter used by the clustering eval — only val2017 images whose annotations contain exactly one distinct category survive (≈15-18% of the requested samples).
-- **CIFAR-10**: every sample's native class label (10 classes). No filter; all `--pca_num_samples` images are used.
+`pca_class` is a variant of `pca` that **colors points by class and shapes by modality** (image=square `s`, text=star `*`, marker convention borrowed from TempModGap). Class labels come from `instances_val2017.json` via the single-object filter used by the clustering eval — only val2017 images whose annotations contain exactly one distinct category survive (≈15-18% of the requested samples).
 
 Useful for verifying that text and image embeddings of the same semantic class converge to the same region of the sphere as training progresses (paper Figure 2 style).
 

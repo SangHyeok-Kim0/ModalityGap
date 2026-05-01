@@ -4,7 +4,7 @@
 
 # Identifiers
 project_name: "modality_gap"
-run_name: auto   # 'auto' / null / "" → {dataset}_{model}_{YYYYMMDD-HHMMSS}; or set explicitly e.g. "MyRun"
+run_name: auto   # 'auto' / null / "" → coco_{model}_{YYYYMMDD-HHMMSS}; or set explicitly e.g. "MyRun"
 
 # Never change parameters
 seed: 42
@@ -20,7 +20,11 @@ loss_type: "only_lunif_n_then_anchor+ALPHA*lalign+BETA*lunif(centroids)"
 only_lunif_epochs: 0
 anchor_temperature: 0.1
 anchor_temperature_learnable: false
-dataset: 'coco'
+
+# Static loss weights (used by loss_type "only_lunif_n_then_anchor+lalign+lunif(centroids)").
+# Other loss_types ignore these.
+lambda1: 1.0
+lambda2: 1.0
 
 # Evaluation and checkpointing
 save_checkpoint_every_n_epochs: 20
@@ -36,4 +40,4 @@ beta_decay_epoch: 50
 
 #ALPHA CONFIG
 alpha_warmup_epoch: 50
-alpha_increment_epoch: 50 
+alpha_increment_epoch: 50

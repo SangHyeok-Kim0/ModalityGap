@@ -114,12 +114,18 @@ class LabelSmoothing(nn.Module):
         return loss.mean()
 
 class ClipLoss(nn.Module):
+    """Symmetric contrastive (CLIP) loss with optional learnable temperature.
+
+    The temperature scalar lives here:
+      - learnable=True  → nn.Parameter (optimizer picks it up via self.parameters())
+      - learnable=False → buffer (moves with .to(device), not optimized)
+
+    Inputs are assumed to be unit-norm — the caller normalizes the encoder
+    outputs before invoking the loss. (Re-normalizing inside would be a
+    harmless no-op but wastes compute, since every call site already does it.)
+    """
     def __init__(self, temperature=0.07, learnable=False):
         super().__init__()
-        # Owns the temperature scalar. When learnable, register as Parameter so
-        # it shows up in self.parameters() / state_dict() and the optimizer
-        # picks it up. Otherwise register as a buffer so .to(device) still
-        # moves it but it is not optimized.
         t = torch.tensor(float(temperature))
         if learnable:
             self.temperature = nn.Parameter(t)
@@ -127,56 +133,37 @@ class ClipLoss(nn.Module):
             self.register_buffer("temperature", t)
 
     def forward(self, image_features, text_features):
-        # image features: [B,D]
-        # text features: [B,D]
-
-        # Normalize
-        image_features = F.normalize(image_features, dim=1)
-        text_features = F.normalize(text_features, dim=1)
-
-        # Similarity matrix and temperature scaling
-        logits_per_image = image_features @ text_features.t() / self.temperature
-        logits_per_text = text_features @ image_features.t() / self.temperature
+        # image_features, text_features: [B, D], expected unit-norm.
+        # Single matmul; the t→i direction reuses the transpose.
+        logits = image_features @ text_features.t() / self.temperature
 
         batch_size = image_features.size(0)
-        labels = torch.arange(batch_size).to(image_features.device)
+        labels = torch.arange(batch_size, device=logits.device)
 
-        loss_i2t = F.cross_entropy(logits_per_image, labels)
-        loss_t2i = F.cross_entropy(logits_per_text, labels)
-
+        loss_i2t = F.cross_entropy(logits,     labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
         return (loss_i2t + loss_t2i) / 2
-    
+
 
 def contrastive_loss(image_embeds, text_embeds, temperature=0.07):
-    """
-    image_embeds: (batch_size, embed_dim)
-    text_embeds: (batch_size, embed_dim)
-    temperature: scalar float for scaling similarities
-    returns: scalar loss (contrastive)
-    """
-    
-    # Similarity matrix, shape (bs, bs)
-    logits = image_embeds @ text_embeds.t()
-    logits = logits / temperature
+    """Symmetric InfoNCE / CLIP loss as a plain function (no learnable state).
 
-    # Targets are just the diagonal (i.e. 0->0, 1->1, ...)
+    Use this when you have a temperature scalar (or `nn.Parameter`) in hand
+    and don't want to construct a `ClipLoss` module just to invoke it. Inputs
+    are assumed unit-norm.
+    """
+    logits = image_embeds @ text_embeds.t() / temperature
     batch_size = image_embeds.size(0)
     target = torch.arange(batch_size, device=logits.device)
-
-    # CE loss for image->text
-    loss_i2t = F.cross_entropy(logits, target)
-    # CE loss for text->image
+    loss_i2t = F.cross_entropy(logits,     target)
     loss_t2i = F.cross_entropy(logits.t(), target)
-
-    # Average the two directions
     return (loss_i2t + loss_t2i) / 2
-
 
 
 def lunif_loss(x, t=2):
     # Compute pairwise distances between all embeddings
     sq_pdist = torch.pdist(x, p=2).pow(2)
-    
+
     # Apply the uniformity loss formula
     return sq_pdist.mul(-t).exp().mean().log()
 
@@ -185,51 +172,27 @@ def lalign_loss(x, y, alpha=2):
     return (x - y).norm(dim=1).pow(alpha).mean()
 
 
+def lunif_modality(image_embeds, text_embeds):
+    """Per-modality uniformity, averaged across the two modalities."""
+    return (lunif_loss(image_embeds) + lunif_loss(text_embeds)) / 2
+
+
+def lunif_centroid(image_embeds, text_embeds):
+    """Uniformity of the (image, text) centroids on the unit sphere."""
+    centroids = compute_centroids(image_embeds, text_embeds)
+    centroids = F.normalize(centroids, dim=-1)
+    return lunif_loss(centroids)
+
+
 def compute_centroids(text_embeddings, visual_embeddings):
-    """
-    Computes the centroid for each pair of samples between text embeddings and visual embeddings
-    by calculating the mean of the corresponding feature vectors across the two modalities.
+    """Element-wise centroid for each (text_i, visual_i) pair: mean of the
+    two embeddings.
 
     Parameters:
-    - text_embeddings (torch.Tensor): Tensor of shape (batch_size1, feature_dim) representing text embeddings.
-    - visual_embeddings (torch.Tensor): Tensor of shape (batch_size2, feature_dim) representing visual embeddings.
+    - text_embeddings   (torch.Tensor): shape (batch_size, feature_dim)
+    - visual_embeddings (torch.Tensor): shape (batch_size, feature_dim)
 
     Returns:
-    - torch.Tensor: Tensor of shape (batch_size1, batch_size2, feature_dim) representing the centroid for each pair.
+    - torch.Tensor: shape (batch_size, feature_dim)
     """
-
-    # Compute centroids by averaging text and visual embeddings
-    # Expand the dimensions to allow pairwise computation
-    text_expanded = text_embeddings.unsqueeze(1)  # Shape: [batch_size1, 1, feature_dim]
-    visual_expanded = visual_embeddings.unsqueeze(0)  # Shape: [1, batch_size2, feature_dim]
-
-    # Compute the centroid by averaging the embeddings
-    centroids = (text_expanded + visual_expanded) / 2.0
-
-    # Compute norms of the centroids
-    centroid_norms = torch.norm(centroids, dim=-1)
-
-    return centroid_norms, centroids
-
-def compute_centroids_only(text_embeddings, visual_embeddings):
-    """
-    Computes the centroid for each pair of samples between text embeddings and visual embeddings
-    by calculating the mean of the corresponding feature vectors across the two modalities.
-
-    Parameters:
-    - text_embeddings (torch.Tensor): Tensor of shape (batch_size1, feature_dim) representing text embeddings.
-    - visual_embeddings (torch.Tensor): Tensor of shape (batch_size2, feature_dim) representing visual embeddings.
-
-    Returns:
-    - torch.Tensor: Tensor of shape (batch_size1, batch_size2, feature_dim) representing the centroid for each pair.
-    """
-
-    # Compute centroids by averaging text and visual embeddings
-    # Expand the dimensions to allow pairwise computation
-    #text_expanded = text_embeddings.unsqueeze(1)  # Shape: [batch_size1, 1, feature_dim]
-    #visual_expanded = visual_embeddings.unsqueeze(0)  # Shape: [1, batch_size2, feature_dim]
-
-    # Compute the centroid by averaging the embeddings
-    centroids = (text_embeddings + visual_embeddings) / 2.0
-
-    return  centroids
+    return (text_embeddings + visual_embeddings) / 2.0
