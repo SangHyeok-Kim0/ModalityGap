@@ -431,7 +431,7 @@ def _make_class_palette(num_classes: int) -> np.ndarray:
 
 def plot_pca_latent_space_class(run_name: str, fig_dir: str,
                                 epochs: List[int] = None,
-                                num_samples: int = 1000,
+                                num_samples: int = 5000,
                                 device: str = "cuda:0"):
     """Variant of `plot_pca_latent_space` that colors points by class.
 
@@ -693,9 +693,9 @@ def main():
     parser.add_argument("--pca_epochs", nargs="*", type=int, default=None,
                         help="Specific epochs to include in the PCA plot "
                              "(must match available checkpoints)")
-    parser.add_argument("--pca_num_samples", type=int, default=1000,
+    parser.add_argument("--pca_num_samples", type=int, default=5000,
                         help="Number of validation samples to use for PCA "
-                             "post-hoc inference (default: 1000)")
+                             "post-hoc inference (default: 5000)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device for PCA inference (default: cuda:0)")
     parser.add_argument("--hist_epochs", nargs="*", type=int, default=None,

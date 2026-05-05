@@ -17,7 +17,6 @@ from tqdm import tqdm
 from data import get_coco_dataloaders
 from losses import (
     ClipLoss,
-    contrastive_loss,
     get_alpha,
     get_beta,
     get_cosine_schedule_with_warmup,
@@ -68,6 +67,51 @@ _WARMUP_LOSS_TYPES = {
     LOSS_LUNIF_THEN_AB_CENT,
 }
 
+# Loss types whose objective contains an alpha-scheduled `lalign` term.
+_ALPHA_LOSS_TYPES = {LOSS_LUNIF_THEN_AB_FULL, LOSS_LUNIF_THEN_AB_CENT}
+
+# Loss types whose objective contains a beta-scheduled lunif term.
+_BETA_LOSS_TYPES  = {LOSS_LUNIF_THEN_BLUNIF, LOSS_LUNIF_THEN_AB_FULL, LOSS_LUNIF_THEN_AB_CENT}
+
+
+def _fmt_lr(lr):
+    # 0.0001 → "1e-4" (compact scientific, no leading zero in exponent).
+    return f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e").replace("e+", "e")
+
+
+def build_auto_run_name(config):
+    """Build run_name from the most-frequently-changed hyperparameters.
+
+    Order: model → batch_size → lr → epochs → temperature mode → precision
+    → α/β schedules (only when the chosen loss_type uses them).
+    A timestamp suffix is appended to prevent runs/<name>/ collisions when
+    two launches share identical hyperparameters.
+    """
+    from datetime import datetime
+
+    # Resolve precision with backward-compat for legacy `fp16: bool` configs.
+    precision = config.get("precision")
+    if precision is None:
+        precision = "fp16" if config.get("fp16", False) else "fp32"
+
+    parts = [
+        config["model"].replace("/", "-"),  # ViT-B/32 → ViT-B-32 (slash unsafe in paths)
+        f"bs{config['batch_size']}",
+        f"lr{_fmt_lr(config['learning_rate'])}",
+        f"ep{config['epochs']}",
+        "Tlearn" if config["anchor_temperature_learnable"] else "Tfix",
+        precision,
+    ]
+
+    loss_type = config["loss_type"]
+    if loss_type in _ALPHA_LOSS_TYPES:
+        parts.append(f"a{config['alpha_warmup_epoch']}-{config['alpha_increment_epoch']}")
+    if loss_type in _BETA_LOSS_TYPES:
+        parts.append(f"b{config['beta_warmup_epoch']}-{config['beta_decay_epoch']}")
+
+    parts.append(datetime.now().strftime("%Y%m%d-%H%M%S"))
+    return "_".join(parts)
+
 
 def setup_run_dir(run_name):
     run_dir  = os.path.join(RUNS_ROOT, run_name)
@@ -98,12 +142,14 @@ def per_loss_grad_norms(components, params):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_model(model, test_loader, device, model_name, config,
-                   epoch=None, emb_dir=None, plot_embeddings=True, clip_loss=None):
+def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
+                   epoch=None, emb_dir=None, plot_embeddings=True):
     """Run text↔image retrieval + clustering eval on test_loader.
 
     Returns the per-key metric dict (also written to wandb under semantic
     prefixes, and dumped to {emb_dir}/epoch_NNN.pt for post-hoc visualization).
+    `clip_loss` is the trained `ClipLoss` instance — its temperature (which
+    may be learnable) is used for the val_loss/anchor computation.
     """
     model.eval()
     tokenizer = open_clip.get_tokenizer(model_name)
@@ -116,14 +162,6 @@ def evaluate_model(model, test_loader, device, model_name, config,
     # loss/{anchor,lalign,lunif_centroids} components.
     val_loss_acc = {"anchor": 0.0, "lalign": 0.0,
                     "lunif_centroids": 0.0, "n_batches": 0}
-    if clip_loss is None:
-        # Fresh ClipLoss so val_loss is still computable at the post-training
-        # full-val site (which passes clip_loss=None).
-        eval_temperature = ClipLoss(
-            temperature=config["anchor_temperature"], learnable=False,
-        ).to(device).temperature
-    else:
-        eval_temperature = clip_loss.temperature
 
     with torch.no_grad():
         loader_iter = tqdm(test_loader, desc="Evaluating") if plot_embeddings else test_loader
@@ -138,7 +176,7 @@ def evaluate_model(model, test_loader, device, model_name, config,
             # Normalize for val-loss components (mirrors training flow).
             ie_n = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
             te_n = text_embeds  / text_embeds.norm(dim=-1, keepdim=True)
-            val_loss_acc["anchor"]          += contrastive_loss(ie_n, te_n, temperature=eval_temperature).item()
+            val_loss_acc["anchor"]          += clip_loss(ie_n, te_n).item()
             val_loss_acc["lalign"]          += lalign_loss(ie_n, te_n).item()
             val_loss_acc["lunif_centroids"] += lunif_centroid(ie_n, te_n).item()
             val_loss_acc["n_batches"]       += 1
@@ -231,7 +269,12 @@ def evaluate_model(model, test_loader, device, model_name, config,
         if k in _embed_keys:
             return f"embedding/{k}"
         return f"clustering/{k}"
-    wandb.log({_wandb_key(k): v for k, v in final_log.items()})
+    eval_log = {_wandb_key(k): v for k, v in final_log.items()}
+    # Log epoch for x-axis alignment with training metrics. `epoch` may be
+    # int (per-epoch eval) or str (e.g. "final_full") — only log when numeric.
+    if isinstance(epoch, (int, float)) and not isinstance(epoch, bool):
+        eval_log["epoch"] = float(epoch)
+    wandb.log(eval_log)
 
     model.train()
     return final_log
@@ -242,53 +285,65 @@ def evaluate_model(model, test_loader, device, model_name, config,
 # ---------------------------------------------------------------------------
 
 def _compute_loss(loss_type, image_embeds, text_embeds,
-                  *, in_warmup, clip_loss, temperature,
+                  *, in_warmup, clip_loss,
                   current_batch, t_total, config):
     """Compute the training loss for `loss_type`.
 
-    Returns (loss, named_tensors, alpha, beta) where:
-      - `named_tensors` is `{name: tensor}` for the components train_model
-        logs as `loss/<name>` (and grad_norm/<name> for EXP 10).
+    Returns (loss, named, alpha, beta, total_unweighted) where:
+      - `loss` is the (possibly weighted) optimization target.
+      - `named` is `{component_name: tensor}` for every term in this branch —
+        train_model logs `loss/<name>` for each, regardless of loss_type.
       - alpha, beta are the current schedule weights (0.0 if unused).
+      - `total_unweighted` is the sum of the un-multiplied components, so it
+        stays comparable across phase boundaries even when alpha/beta change.
+
+    `clip_loss` is the shared `ClipLoss` instance — it owns the temperature
+    scalar and computes the symmetric contrastive (anchor) term.
     """
     # All "only_lunif_n_then_*" types share the same warmup objective.
     if in_warmup:
         lunif_img = lunif_loss(image_embeds)
         lunif_txt = lunif_loss(text_embeds)
         loss = (lunif_img + lunif_txt) / 2
-        # Only EXP 10 logs per-modality lunif during warmup.
-        named = ({"lunif_img": lunif_img, "lunif_txt": lunif_txt}
-                 if loss_type == LOSS_LUNIF_THEN_AB_CENT else {})
-        return loss, named, 0.0, 0.0
+        named = {"lunif_img": lunif_img, "lunif_txt": lunif_txt}
+        return loss, named, 0.0, 0.0, loss
 
     alpha, beta = 0.0, 0.0
-    named = {}
 
     if loss_type == LOSS_ANCHOR:
-        loss = clip_loss(image_embeds, text_embeds)
+        anchor = clip_loss(image_embeds, text_embeds)
+        loss = anchor
+        named = {"anchor": anchor}
+        total_unweighted = anchor
 
     elif loss_type == LOSS_LUNIF_THEN_FULL:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif  = lunif_modality(image_embeds, text_embeds)
         loss = anchor + lunif + lalign
+        named = {"anchor": anchor, "lalign": lalign, "lunif_modality": lunif}
+        total_unweighted = anchor + lalign + lunif
 
     elif loss_type == LOSS_LUNIF_THEN_CENT:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif_cent = lunif_centroid(image_embeds, text_embeds)
         loss = anchor + config["lambda1"] * lalign + config["lambda2"] * lunif_cent
+        named = {"anchor": anchor, "lalign": lalign, "lunif_centroids": lunif_cent}
+        total_unweighted = anchor + lalign + lunif_cent
 
     elif loss_type == LOSS_LUNIF_THEN_BLUNIF:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif  = lunif_modality(image_embeds, text_embeds)
         beta = get_beta(current_batch, t_total,
                         config["beta_warmup_epoch"], config["beta_decay_epoch"])
         loss = anchor + lalign + beta * lunif
+        named = {"anchor": anchor, "lalign": lalign, "lunif_modality": lunif}
+        total_unweighted = anchor + lalign + lunif
 
     elif loss_type == LOSS_LUNIF_THEN_AB_FULL:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif  = lunif_modality(image_embeds, text_embeds)
         alpha = get_alpha(current_batch, t_total,
@@ -296,9 +351,11 @@ def _compute_loss(loss_type, image_embeds, text_embeds,
         beta  = get_beta(current_batch, t_total,
                          config["beta_warmup_epoch"], config["beta_decay_epoch"])
         loss = anchor + alpha * lalign + beta * lunif
+        named = {"anchor": anchor, "lalign": lalign, "lunif_modality": lunif}
+        total_unweighted = anchor + lalign + lunif
 
     elif loss_type == LOSS_LUNIF_THEN_AB_CENT:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif_cent = lunif_centroid(image_embeds, text_embeds)
         alpha = get_alpha(current_batch, t_total,
@@ -307,33 +364,42 @@ def _compute_loss(loss_type, image_embeds, text_embeds,
                          config["beta_warmup_epoch"], config["beta_decay_epoch"])
         loss = anchor + alpha * lalign + beta * lunif_cent
         named = {"anchor": anchor, "lalign": lalign, "lunif_centroids": lunif_cent}
+        total_unweighted = anchor + lalign + lunif_cent
 
     elif loss_type == LOSS_ABL_FULL:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif_cent = lunif_centroid(image_embeds, text_embeds)
         loss = anchor + lalign + lunif_cent
+        named = {"anchor": anchor, "lalign": lalign, "lunif_centroids": lunif_cent}
+        total_unweighted = loss
 
     elif loss_type == LOSS_ABL_NO_UNIF:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lalign = lalign_loss(image_embeds, text_embeds)
         loss = anchor + lalign
+        named = {"anchor": anchor, "lalign": lalign}
+        total_unweighted = loss
 
     elif loss_type == LOSS_ABL_NO_ALIGN:
-        anchor = contrastive_loss(image_embeds, text_embeds, temperature=temperature)
+        anchor = clip_loss(image_embeds, text_embeds)
         lunif_cent = lunif_centroid(image_embeds, text_embeds)
         loss = anchor + lunif_cent
+        named = {"anchor": anchor, "lunif_centroids": lunif_cent}
+        total_unweighted = loss
 
     elif loss_type == LOSS_LALIGN_LUNIF:
         # Despite the name, this branch has NO anchor and NO warmup phase.
         lalign = lalign_loss(image_embeds, text_embeds)
         lunif_cent = lunif_centroid(image_embeds, text_embeds)
         loss = lalign + lunif_cent
+        named = {"lalign": lalign, "lunif_centroids": lunif_cent}
+        total_unweighted = loss
 
     else:
         raise ValueError(f"Unknown loss_type: {loss_type}")
 
-    return loss, named, alpha, beta
+    return loss, named, alpha, beta, total_unweighted
 
 
 # ---------------------------------------------------------------------------
@@ -355,15 +421,14 @@ def train_model(config, train_loader, test_loader, device,
     model = torch.nn.DataParallel(model)
 
     # ClipLoss owns the temperature scalar (Parameter when learnable, buffer
-    # otherwise). All other branches reuse clip_loss.temperature so gradients
-    # flow into the same tensor.
+    # otherwise) and is the single source for the anchor (contrastive) term
+    # across every loss_type branch.
     clip_loss = ClipLoss(
         temperature=config["anchor_temperature"],
         learnable=config["anchor_temperature_learnable"],
     ).to(device)
     if config["anchor_temperature_learnable"]:
         print("Using learnable temperature parameter")
-    temperature = clip_loss.temperature
 
     start_epoch = 0
     if config["resume_checkpoint"]:
@@ -375,7 +440,7 @@ def train_model(config, train_loader, test_loader, device,
     # unless temperature is learnable).
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(clip_loss.parameters()),
-        lr=1e-4,
+        lr=config["learning_rate"],
     )
 
     epochs = config["epochs"]
@@ -405,10 +470,20 @@ def train_model(config, train_loader, test_loader, device,
     save_every_n   = config["save_checkpoint_every_n_epochs"]
     grad_log_every = int(config.get("grad_log_every_n_steps", 100))
 
-    use_amp   = bool(config.get("fp16", False)) and device.type == "cuda"
-    amp_dtype = torch.float16
-    scaler    = torch.amp.GradScaler('cuda', enabled=use_amp)
-    print(f"Mixed precision (fp16 AMP): {'ENABLED' if use_amp else 'disabled (running fp32)'}")
+    # Precision resolution: prefer new `precision: fp32|fp16|bf16`; fall back
+    # to legacy `fp16: bool` for older config files.
+    precision = config.get("precision")
+    if precision is None:
+        precision = "fp16" if config.get("fp16", False) else "fp32"
+    if precision not in {"fp32", "fp16", "bf16"}:
+        raise ValueError(f"Unknown precision: {precision!r} (expected fp32|fp16|bf16)")
+
+    use_amp   = (precision != "fp32") and device.type == "cuda"
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(precision, torch.float32)
+    # bf16 has fp32-equivalent dynamic range, so no GradScaler needed; only
+    # fp16 risks underflow and benefits from loss scaling.
+    scaler    = torch.amp.GradScaler('cuda', enabled=(precision == "fp16" and use_amp))
+    print(f"Mixed precision: {precision}{' (AMP)' if use_amp else ' (no AMP)'}")
 
     loss_type         = config["loss_type"]
     only_lunif_epochs = config["only_lunif_epochs"]
@@ -431,13 +506,13 @@ def train_model(config, train_loader, test_loader, device,
                 image_embeds = image_embeds / image_embeds.norm(dim=-1, keepdim=True)
                 text_embeds  = text_embeds  / text_embeds.norm(dim=-1, keepdim=True)
 
-                loss, named_tensors, alpha, beta = _compute_loss(
+                loss, named_tensors, alpha, beta, total_unweighted = _compute_loss(
                     loss_type, image_embeds, text_embeds,
-                    in_warmup=in_warmup, clip_loss=clip_loss, temperature=temperature,
+                    in_warmup=in_warmup, clip_loss=clip_loss,
                     current_batch=current_batch, t_total=t_total, config=config,
                 )
 
-            # Per-component values (cheap, every step).
+            # Per-component values (cheap, every step, every loss_type).
             extra_log = {f"loss/{k}": v.item() for k, v in named_tensors.items()}
 
             # Per-component grad norms (expensive — one extra backward per
@@ -453,15 +528,18 @@ def train_model(config, train_loader, test_loader, device,
                 gn = per_loss_grad_norms(named_tensors, grad_params)
                 extra_log.update({f"grad_norm/{k}": v for k, v in gn.items()})
 
+            payload = {
+                "loss/total":            loss.item(),             # weighted (optimization target)
+                "loss/total_unweighted": total_unweighted.item(), # comparable across α/β phases
+                "optim/learning_rate":   scheduler.get_last_lr()[0],
+                "optim/alpha":           alpha,
+                "optim/beta":            beta,
+                # Fractional epoch — usable as wandb x-axis to compare runs
+                # with different batch sizes (step count differs, epoch doesn't).
+                "epoch":                 start_epoch + current_batch / len(train_loader),
+            }
             if config["anchor_temperature_learnable"]:
-                payload = {"loss/total":          loss.item(),
-                           "optim/temperature":   clip_loss.temperature.item(),
-                           "optim/learning_rate": scheduler.get_last_lr()[0]}
-            else:
-                payload = {"loss/total":          loss.item(),
-                           "optim/learning_rate": scheduler.get_last_lr()[0],
-                           "optim/alpha":         alpha,
-                           "optim/beta":          beta}
+                payload["optim/temperature"] = clip_loss.temperature.item()
             payload.update(extra_log)
             wandb.log(payload)
 
@@ -485,7 +563,7 @@ def train_model(config, train_loader, test_loader, device,
                        os.path.join(ckpt_dir, f"epoch_{epoch_one_indexed:03d}.pt"))
             print(f"Model saved at epoch {epoch_one_indexed}")
 
-    return model
+    return model, clip_loss
 
 
 # ---------------------------------------------------------------------------
@@ -504,12 +582,10 @@ def set_seed(seed):
 
 def main(config):
     # Resolve run_name. If left as null/empty/"auto" in config.yaml, generate
-    # `coco_{model}_{YYYYMMDD-HHMMSS}` so each launch gets a unique directory
-    # under runs/ without manual edits.
+    # `{model}_{loss-tag}_{relevant-hparams}_{YYYYMMDD-HHMMSS}` so each launch
+    # gets a unique, self-describing directory under runs/ without manual edits.
     if config.get("run_name") in (None, "", "auto"):
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        config["run_name"] = f"coco_{config['model']}_{ts}"
+        config["run_name"] = build_auto_run_name(config)
         print(f"Auto-generated run_name: {config['run_name']}")
 
     wandb.init(project=config["project_name"], config=config, name=config['run_name'])
@@ -534,8 +610,8 @@ def main(config):
     print("Dataset loaded.\n")
 
     print("Training the model...")
-    model = train_model(config, train_loader, test_loader, device,
-                        ckpt_dir=ckpt_dir, emb_dir=emb_dir)
+    model, clip_loss = train_model(config, train_loader, test_loader, device,
+                                   ckpt_dir=ckpt_dir, emb_dir=emb_dir)
     print("Training complete.\n")
 
     # Final evaluation on the FULL validation set (overrides num_test_samples).
@@ -549,9 +625,9 @@ def main(config):
         model, full_test_loader, device,
         model_name=config["model"],
         config=config,
+        clip_loss=clip_loss,
         epoch="final_full",
         emb_dir=emb_dir,
-        clip_loss=None,
     )
     print("Evaluation complete.\n")
     print("Final evaluation results:", final_log)

@@ -145,21 +145,6 @@ class ClipLoss(nn.Module):
         return (loss_i2t + loss_t2i) / 2
 
 
-def contrastive_loss(image_embeds, text_embeds, temperature=0.07):
-    """Symmetric InfoNCE / CLIP loss as a plain function (no learnable state).
-
-    Use this when you have a temperature scalar (or `nn.Parameter`) in hand
-    and don't want to construct a `ClipLoss` module just to invoke it. Inputs
-    are assumed unit-norm.
-    """
-    logits = image_embeds @ text_embeds.t() / temperature
-    batch_size = image_embeds.size(0)
-    target = torch.arange(batch_size, device=logits.device)
-    loss_i2t = F.cross_entropy(logits,     target)
-    loss_t2i = F.cross_entropy(logits.t(), target)
-    return (loss_i2t + loss_t2i) / 2
-
-
 def lunif_loss(x, t=2):
     # Compute pairwise distances between all embeddings
     sq_pdist = torch.pdist(x, p=2).pow(2)
