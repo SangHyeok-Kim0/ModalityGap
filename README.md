@@ -122,7 +122,7 @@ Useful for verifying that text and image embeddings of the same semantic class c
 
 ```bash
 # default: 1000 samples, ~init/⅓/⅔/final epochs nearest to saved checkpoints
-python Code/ModalityGap/visualization.py --run_name <run_name> --plots pca
+python Code/ModalityGap/visualization.py --plots pca  --pca_num_samples 1000 <run_name>
 
 # class-colored variant
 python Code/ModalityGap/visualization.py --run_name <run_name> --plots pca_class

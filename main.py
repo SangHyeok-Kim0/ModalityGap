@@ -30,6 +30,7 @@ from metrics import (
     compute_gap,
     compute_mean_angular_value_of_a_modality,
     compute_metric_ret,
+    linear_modality_classifier_acc,
     mean_distance_of_true_pairs,
     uniformity,
 )
@@ -204,6 +205,10 @@ def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
     mean_ang_text  = compute_mean_angular_value_of_a_modality(all_text_embeds)
     uniformity_metric = uniformity(all_image_embeds, all_text_embeds)
     mean_cos_true_pairs = mean_distance_of_true_pairs(all_image_embeds, all_text_embeds)
+    # Linear probe: how distinguishable are the two modalities by any linear
+    # classifier? Complements `gap` (centroid distance) by also catching
+    # non-additive, distribution-shape differences.
+    modality_clf_acc = linear_modality_classifier_acc(all_image_embeds, all_text_embeds)
     clustering_metrics = compute_clustering_metrics(
         all_text_embeds, all_image_embeds, ids_txt)
 
@@ -227,6 +232,7 @@ def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
         'mean_angular_value_text':          round(mean_ang_text, 4),
         'uniformity':                       round(uniformity_metric, 4),
         'mean_cosine_similarity_true_pairs': round(mean_cos_true_pairs, 4),
+        'linear_modality_classifier_acc':    round(modality_clf_acc, 4),
         **clustering_metrics,
         **val_loss_log,
     }
@@ -260,7 +266,8 @@ def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
     # Wandb keys: prefix by section so the UI auto-groups them. Snapshot keys
     # stay flat so visualization.py readers don't have to know about prefixes.
     _embed_keys = {"gap", "uniformity", "mean_angular_value_image",
-                   "mean_angular_value_text", "mean_cosine_similarity_true_pairs"}
+                   "mean_angular_value_text", "mean_cosine_similarity_true_pairs",
+                   "linear_modality_classifier_acc"}
     def _wandb_key(k):
         if "/" in k:
             return k  # already prefixed (e.g. val_loss/anchor)

@@ -322,3 +322,30 @@ def mean_distance_of_true_pairs(features_modality1: torch.Tensor, features_modal
 
         return euclidean_tv_mean
 
+
+def linear_modality_classifier_acc(features_modality1: torch.Tensor,
+                                   features_modality2: torch.Tensor,
+                                   cv_folds: int = 5) -> float:
+    """5-fold CV accuracy of a logistic regression classifying modality from
+    embedding alone. 0.5 ≈ modalities indistinguishable by any linear
+    classifier (gap closed in the strong sense); 1.0 ≈ perfectly linearly
+    separable (large gap or modality-specific shells).
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+
+    X1 = features_modality1.detach().cpu().numpy()
+    X2 = features_modality2.detach().cpu().numpy()
+    X  = np.concatenate([X1, X2], axis=0)
+    y  = np.concatenate([np.zeros(len(X1)), np.ones(len(X2))])
+
+    # Guard against tiny N (cv requires ≥cv samples per class).
+    n_min = min(len(X1), len(X2))
+    cv = min(cv_folds, n_min)
+    if cv < 2:
+        clf = LogisticRegression(max_iter=200).fit(X, y)
+        return float(clf.score(X, y))
+
+    scores = cross_val_score(LogisticRegression(max_iter=200), X, y, cv=cv)
+    return float(scores.mean())
+
