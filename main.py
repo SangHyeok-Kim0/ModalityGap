@@ -118,9 +118,14 @@ def setup_run_dir(run_name):
     run_dir  = os.path.join(RUNS_ROOT, run_name)
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
     emb_dir  = os.path.join(run_dir, 'embeddings')
+    fig_dir  = os.path.join(run_dir, 'figures')
+    # Per-epoch PCA snapshots emitted inline during training (see
+    # `evaluate_model` + visualization.plot_pca_single_epoch).
+    pca_fig_dir = os.path.join(fig_dir, 'PCA')
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(emb_dir, exist_ok=True)
-    return run_dir, ckpt_dir, emb_dir
+    os.makedirs(pca_fig_dir, exist_ok=True)
+    return run_dir, ckpt_dir, emb_dir, pca_fig_dir
 
 
 def per_loss_grad_norms(components, params):
@@ -144,7 +149,8 @@ def per_loss_grad_norms(components, params):
 # ---------------------------------------------------------------------------
 
 def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
-                   epoch=None, emb_dir=None, plot_embeddings=True):
+                   epoch=None, emb_dir=None, plot_embeddings=True,
+                   pca_fig_dir=None):
     """Run text↔image retrieval + clustering eval on test_loader.
 
     Returns the per-key metric dict (also written to wandb under semantic
@@ -262,6 +268,19 @@ def evaluate_model(model, test_loader, device, model_name, config, clip_loss,
             "labels":       np.array([]),  # historical key, kept empty for COCO
             "metrics":      final_log,
         }, os.path.join(emb_dir, snap_name))
+
+    # Inline PCA snapshots — reuse the embeddings we just computed (no extra
+    # forward pass). Lazy import so visualization.py's matplotlib backend
+    # only loads when an inline plot is actually requested.
+    if pca_fig_dir is not None and epoch is not None:
+        from visualization import plot_pca_single_epoch
+        plot_pca_single_epoch(
+            image_embeds=all_image_embeds.detach().cpu().numpy(),
+            text_embeds=all_text_embeds.detach().cpu().numpy(),
+            sample_ids=list(ids_img),
+            epoch=epoch,
+            fig_dir=pca_fig_dir,
+        )
 
     # Wandb keys: prefix by section so the UI auto-groups them. Snapshot keys
     # stay flat so visualization.py readers don't have to know about prefixes.
@@ -414,7 +433,7 @@ def _compute_loss(loss_type, image_embeds, text_embeds,
 # ---------------------------------------------------------------------------
 
 def train_model(config, train_loader, test_loader, device,
-                ckpt_dir=None, emb_dir=None):
+                ckpt_dir=None, emb_dir=None, pca_fig_dir=None):
     # Build OpenCLIP from scratch (no pretrained weights).
     model, _, _ = open_clip.create_model_and_transforms(
         config["model"], pretrained=None, device=device,
@@ -464,8 +483,11 @@ def train_model(config, train_loader, test_loader, device,
         torch.save(model.state_dict(), os.path.join(ckpt_dir, "epoch_000.pt"))
 
     print("Evaluating model before training...")
+    # Always emit the init PCA snapshot (epoch 0) when pca_fig_dir is set —
+    # this is the "init" reference panel.
     evaluate_model(model, test_loader, device, model_name=config["model"],
-                   config=config, epoch=0, emb_dir=emb_dir, clip_loss=clip_loss)
+                   config=config, epoch=0, emb_dir=emb_dir, clip_loss=clip_loss,
+                   pca_fig_dir=pca_fig_dir)
 
     # Save at every-N epochs PLUS the alpha/beta phase-transition boundaries.
     phase_epochs = {
@@ -475,6 +497,7 @@ def train_model(config, train_loader, test_loader, device,
         config["alpha_warmup_epoch"] + config["alpha_increment_epoch"],
     }
     save_every_n   = config["save_checkpoint_every_n_epochs"]
+    pca_every_n    = int(config.get("pca_plot_every_n_epochs", 0))
     grad_log_every = int(config.get("grad_log_every_n_steps", 100))
 
     # Precision resolution: prefer new `precision: fp32|fp16|bf16`; fall back
@@ -558,11 +581,18 @@ def train_model(config, train_loader, test_loader, device,
 
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
+        # Inline PCA snapshots use the same embeddings evaluate_model already
+        # computes — gated by pca_plot_every_n_epochs to keep the matplotlib
+        # cost off the every-epoch path.
+        epoch_one_indexed = epoch + 1
+        emit_pca = (pca_fig_dir is not None and pca_every_n > 0
+                    and epoch_one_indexed % pca_every_n == 0)
         evaluate_model(model, test_loader, device, model_name=config["model"],
-                       config=config, epoch=epoch + 1, emb_dir=emb_dir, clip_loss=clip_loss)
+                       config=config, epoch=epoch_one_indexed, emb_dir=emb_dir,
+                       clip_loss=clip_loss,
+                       pca_fig_dir=pca_fig_dir if emit_pca else None)
 
         # Save checkpoint at every-N epochs OR at any α/β phase boundary.
-        epoch_one_indexed = epoch + 1
         should_save = ((epoch_one_indexed % save_every_n == 0)
                        or (epoch_one_indexed in phase_epochs))
         if should_save and ckpt_dir is not None:
@@ -602,7 +632,7 @@ def main(config):
 
     device = torch.device(f"cuda:{config['device_id']}" if torch.cuda.is_available() else "cpu")
 
-    run_dir, ckpt_dir, emb_dir = setup_run_dir(config["run_name"])
+    run_dir, ckpt_dir, emb_dir, pca_fig_dir = setup_run_dir(config["run_name"])
     print(f"Run artifacts will be saved under: {run_dir}")
 
     # Authoritative snapshot of "what was actually launched" — written BEFORE
@@ -618,7 +648,8 @@ def main(config):
 
     print("Training the model...")
     model, clip_loss = train_model(config, train_loader, test_loader, device,
-                                   ckpt_dir=ckpt_dir, emb_dir=emb_dir)
+                                   ckpt_dir=ckpt_dir, emb_dir=emb_dir,
+                                   pca_fig_dir=pca_fig_dir)
     print("Training complete.\n")
 
     # Final evaluation on the FULL validation set (overrides num_test_samples).
@@ -635,6 +666,7 @@ def main(config):
         clip_loss=clip_loss,
         epoch="final_full",
         emb_dir=emb_dir,
+        pca_fig_dir=pca_fig_dir,
     )
     print("Evaluation complete.\n")
     print("Final evaluation results:", final_log)

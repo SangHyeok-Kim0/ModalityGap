@@ -53,6 +53,17 @@ def _coco_collate(batch):
     return images, sel_captions, sample_ids
 
 
+def _coco_collate_first(batch):
+    """Test-time collate: always pick captions[0] so the same image's caption
+    is identical across epochs. Lets per-epoch embedding drift be attributed
+    to model updates rather than caption resampling.
+    """
+    images, captions, sample_ids = zip(*batch)
+    images = torch.stack(images, 0)
+    sel_captions = [c[0] for c in captions]
+    return images, sel_captions, sample_ids
+
+
 def _maybe_subset(dataset, n, label):
     if n == -1:
         return dataset
@@ -83,7 +94,7 @@ def get_coco_dataloaders(config):
                               drop_last=True, collate_fn=_coco_collate,
                               num_workers=num_workers)
     test_loader  = DataLoader(test_coco,  batch_size=batch_size, shuffle=False,
-                              drop_last=True, collate_fn=_coco_collate,
+                              drop_last=True, collate_fn=_coco_collate_first,
                               num_workers=0)
 
     return train_loader, test_loader

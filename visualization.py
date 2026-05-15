@@ -608,6 +608,156 @@ def plot_pca_latent_space_class(run_name: str, fig_dir: str,
 
 
 # ----------------------------------------------------------------------------
+# Plot 2c: Inline per-epoch PCA snapshot (called by main.evaluate_model).
+# Single-epoch, 1 row × 3 views. Reuses the embeddings already computed during
+# eval (no fresh inference, no checkpoint reload).
+# ----------------------------------------------------------------------------
+
+_PCA_VIEWS = [
+    ("perspective",     dict(elev=20, azim=-60)),
+    ("front (PC2-PC3)", dict(elev=0,  azim=-90)),
+    ("top (PC1-PC2)",   dict(elev=90, azim=-90)),
+]
+
+
+def _draw_unit_sphere(ax):
+    u = np.linspace(0, 2 * np.pi, 30)
+    v = np.linspace(0, np.pi, 20)
+    sx = np.outer(np.cos(u), np.sin(v))
+    sy = np.outer(np.sin(u), np.sin(v))
+    sz = np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_wireframe(sx, sy, sz, color='gray', alpha=0.15, linewidth=0.4)
+
+
+def _epoch_suffix(epoch) -> str:
+    if isinstance(epoch, str):
+        return epoch  # e.g. "final_full"
+    return f"epoch_{int(epoch):03d}"
+
+
+def plot_pca_single_epoch(image_embeds: np.ndarray,
+                          text_embeds: np.ndarray,
+                          sample_ids: List[int],
+                          epoch,
+                          fig_dir: str,
+                          num_samples_no_class: int = 1000,
+                          num_samples_class: int = 5000):
+    """Emit per-epoch `pca_latent_space_<E>.png` + `pca_latent_space_class_<E>.png`.
+
+    Inputs are already L2-normalized embeddings from evaluate_model. Both
+    panels use 1 row × 3 views (perspective / front / top). No re-inference.
+    """
+    os.makedirs(fig_dir, exist_ok=True)
+    ep = _epoch_suffix(epoch)
+
+    # ---------- no-class panel ----------
+    n = min(num_samples_no_class, len(image_embeds))
+    img_sub = image_embeds[:n]
+    txt_sub = text_embeds[:n]
+    gap = float(np.linalg.norm(img_sub.mean(0) - txt_sub.mean(0)))
+
+    combined = np.concatenate([img_sub, txt_sub], axis=0)
+    proj = PCA(n_components=3).fit_transform(combined)
+    proj = proj / (np.linalg.norm(proj, axis=1, keepdims=True) + 1e-12)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.5),
+                             subplot_kw={'projection': '3d'})
+    for ax, (view_name, view_kw) in zip(axes, _PCA_VIEWS):
+        _draw_unit_sphere(ax)
+        ax.scatter(proj[:n, 0], proj[:n, 1], proj[:n, 2],
+                   c='tab:blue', alpha=0.5, s=10, label='image')
+        ax.scatter(proj[n:, 0], proj[n:, 1], proj[n:, 2],
+                   c='tab:orange', alpha=0.5, s=10, label='text')
+        ax.view_init(**view_kw)
+        ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05); ax.set_zlim(-1.05, 1.05)
+        ax.set_box_aspect([1, 1, 1])
+        ax.set_xlabel('PC1', fontsize=7, labelpad=-4)
+        ax.set_ylabel('PC2', fontsize=7, labelpad=-4)
+        ax.set_zlabel('PC3', fontsize=7, labelpad=-4)
+        ax.tick_params(labelsize=6)
+        ax.set_title(view_name, fontsize=10)
+    axes[0].legend(loc='upper left', fontsize=7)
+    fig.suptitle(f'PCA — epoch {epoch} — gap={gap:.3f} (N={n})', y=1.02)
+    plt.tight_layout()
+    out_path = os.path.join(fig_dir, f"pca_latent_space_{ep}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+
+    # ---------- class-colored panel ----------
+    n_cls = min(num_samples_class, len(image_embeds))
+    res = _filter_single_object_coco(
+        image_embeds[:n_cls], text_embeds[:n_cls], list(sample_ids[:n_cls]))
+    if res is None:
+        warnings.warn(f"epoch {epoch}: no single-object images survived; "
+                      f"skipping class-colored PCA.")
+        return
+    img_f, txt_f, labels_int, label_names = res
+    gap_f = float(np.linalg.norm(img_f.mean(0) - txt_f.mean(0)))
+    n_classes = len(label_names)
+    palette = _make_class_palette(n_classes)
+
+    combined_f = np.concatenate([img_f, txt_f], axis=0)
+    proj_f = PCA(n_components=3).fit_transform(combined_f)
+    proj_f = proj_f / (np.linalg.norm(proj_f, axis=1, keepdims=True) + 1e-12)
+    n_img_f = len(img_f)
+    proj_img = proj_f[:n_img_f]
+    proj_txt = proj_f[n_img_f:]
+    face = palette[labels_int].copy(); face[:, 3] = 0.55
+    edge = palette[labels_int].copy(); edge[:, 3] = 0.85
+
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.5),
+                             subplot_kw={'projection': '3d'})
+    for ax, (view_name, view_kw) in zip(axes, _PCA_VIEWS):
+        _draw_unit_sphere(ax)
+        ax.scatter(proj_img[:, 0], proj_img[:, 1], proj_img[:, 2],
+                   facecolors=face, edgecolors=edge,
+                   marker=_MOD_MARKERS["image"], s=_MOD_SIZES["image"],
+                   linewidths=0.6)
+        ax.scatter(proj_txt[:, 0], proj_txt[:, 1], proj_txt[:, 2],
+                   facecolors=face, edgecolors=edge,
+                   marker=_MOD_MARKERS["text"], s=_MOD_SIZES["text"],
+                   linewidths=0.6)
+        ax.view_init(**view_kw)
+        ax.set_xlim(-1.05, 1.05); ax.set_ylim(-1.05, 1.05); ax.set_zlim(-1.05, 1.05)
+        ax.set_box_aspect([1, 1, 1])
+        ax.set_xlabel('PC1', fontsize=7, labelpad=-4)
+        ax.set_ylabel('PC2', fontsize=7, labelpad=-4)
+        ax.set_zlabel('PC3', fontsize=7, labelpad=-4)
+        ax.tick_params(labelsize=6)
+        ax.set_title(view_name, fontsize=10)
+
+    from matplotlib.lines import Line2D
+    mod_handles = [
+        Line2D([0], [0], marker=_MOD_MARKERS["text"], color="none",
+               markerfacecolor="white", markeredgecolor="0.35",
+               markersize=11, linestyle="None", label=_MOD_LABELS["text"]),
+        Line2D([0], [0], marker=_MOD_MARKERS["image"], color="none",
+               markerfacecolor="white", markeredgecolor="0.35",
+               markersize=9,  linestyle="None", label=_MOD_LABELS["image"]),
+    ]
+    cls_handles = [
+        Line2D([0], [0], marker="o", color="none",
+               markerfacecolor=palette[i], markeredgecolor=palette[i],
+               markersize=8, linestyle="None", label=label_names[i])
+        for i in range(n_classes)
+    ]
+    fig.legend(handles=mod_handles + cls_handles, loc="lower center",
+               ncol=min(8, len(mod_handles) + n_classes),
+               frameon=True, bbox_to_anchor=(0.5, -0.05),
+               fontsize=8, handlelength=1.0, columnspacing=1.0,
+               handletextpad=0.4, borderpad=0.6)
+    fig.suptitle(
+        f'PCA by class — epoch {epoch} — gap={gap_f:.3f} '
+        f'(N_kept={len(labels_int)}, classes={n_classes})', y=1.02)
+    plt.tight_layout()
+    out_path = os.path.join(fig_dir, f"pca_latent_space_class_{ep}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+# ----------------------------------------------------------------------------
 # Plot 3: pair-distance histograms (true-pair vs random-pair cosine similarity)
 # ----------------------------------------------------------------------------
 
@@ -693,9 +843,13 @@ def main():
     parser.add_argument("--pca_epochs", nargs="*", type=int, default=None,
                         help="Specific epochs to include in the PCA plot "
                              "(must match available checkpoints)")
-    parser.add_argument("--pca_num_samples", type=int, default=5000,
-                        help="Number of validation samples to use for PCA "
-                             "post-hoc inference (default: 5000)")
+    parser.add_argument("--pca_num_samples", type=int, default=1000,
+                        help="N for pca_latent_space.png (no class color, "
+                             "default: 1000)")
+    parser.add_argument("--pca_class_num_samples", type=int, default=5000,
+                        help="N for pca_latent_space_class.png; filtered to "
+                             "single-object COCO images afterwards "
+                             "(default: 5000)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device for PCA inference (default: cuda:0)")
     parser.add_argument("--hist_epochs", nargs="*", type=int, default=None,
@@ -722,7 +876,9 @@ def main():
     for name in args.plots:
         fn = PLOT_REGISTRY[name]
         if name in ("pca", "pca_class"):
-            kwargs = {"num_samples": args.pca_num_samples, "device": args.device}
+            n = (args.pca_class_num_samples if name == "pca_class"
+                 else args.pca_num_samples)
+            kwargs = {"num_samples": n, "device": args.device}
             if args.pca_epochs is not None:
                 kwargs["epochs"] = args.pca_epochs
             fn(args.run_name, fig_dir, **kwargs)
